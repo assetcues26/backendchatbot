@@ -1,0 +1,50 @@
+# Render blueprint. In Render: New -> Blueprint -> pick this repo.
+#
+# Migrations are NOT run from here. The free plan has no pre-deploy hook and
+# no shell, and running Alembic from a web service start command means every
+# restart races to migrate. Run migrations from your machine against Supabase
+# instead -- see docs/RUNBOOK.md.
+
+services:
+  - type: web
+    name: assetcues-chatbot-api
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -e .
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+
+      # Set these in the Render dashboard, not here. sync:false means Render
+      # prompts for them and never stores them in the repository.
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Your Vercel URL. Comma-separated if you add preview domains.
+      - key: CORS_ORIGINS
+        sync: false
+
+      - key: OPENAI_CHAT_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_CLASSIFIER_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: EMBEDDING_DIM
+        value: "1536"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "20"
