@@ -78,6 +78,17 @@ async def cmd_sync(args: argparse.Namespace) -> int:
 
     print(f"Found {len(files)} document(s) under {root}\n")
 
+    # A dry run answers "what would this do" and must not require a database,
+    # a network, or an API key. It is the first thing someone reaches for when
+    # the connection is the thing they are unsure about.
+    if args.dry_run:
+        for path in files:
+            key = source_key_for(path, root)
+            module = path.parent.name if path.parent != root else ""
+            print(f"  would ingest  {key}" + (f"   [module: {module}]" if module else ""))
+        print(f"\n{len(files)} document(s) would be processed. No changes made.")
+        return 0
+
     factory = get_session_factory()
     async with factory() as session:
         tenant_id, role_ids = await seed_all(session)
@@ -91,10 +102,6 @@ async def cmd_sync(args: argparse.Namespace) -> int:
             key = source_key_for(path, root)
             seen_keys.add(key)
             module = path.parent.name if path.parent != root else ""
-
-            if args.dry_run:
-                print(f"  [dry-run] would ingest {key}")
-                continue
 
             try:
                 result = await pipeline.ingest_path(
@@ -285,7 +292,49 @@ def main() -> None:
         finally:
             await dispose_engine()
 
-    sys.exit(asyncio.run(run()))
+    try:
+        sys.exit(asyncio.run(run()))
+    except KeyboardInterrupt:
+        print("\nInterrupted. Documents already committed are unaffected.")
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 - this is the top of a CLI
+        # An operator running a command should get a sentence, not a
+        # traceback. The three failures below are the ones people actually
+        # hit on first setup.
+        sys.exit(_explain(exc))
+
+
+def _explain(exc: Exception) -> str:
+    name = type(exc).__name__
+    text = str(exc)
+
+    if "password authentication failed" in text or name == "InvalidPasswordError":
+        return (
+            "error: the database rejected the credentials in DATABASE_URL.\n"
+            "       Check the password in your .env against Supabase -> "
+            "Settings -> Database."
+        )
+    if name in {"ConnectionRefusedError", "OSError", "TimeoutError"} or (
+        "connect" in text.lower() and "refused" in text.lower()
+    ):
+        return (
+            "error: could not reach the database.\n"
+            f"       {text}\n"
+            "       Check DATABASE_URL, and that the Supabase project is not "
+            "paused."
+        )
+    if "OPENAI_API_KEY" in text:
+        return (
+            "error: OPENAI_API_KEY is not set.\n"
+            "       Add it to .env, or pass --no-classifier to skip all model "
+            "calls."
+        )
+    if "UndefinedTableError" in name or "does not exist" in text:
+        return (
+            "error: the schema is missing. Run:\n"
+            "       python -m alembic upgrade head"
+        )
+    return f"error: {name}: {text}"
 
 
 if __name__ == "__main__":
