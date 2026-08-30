@@ -1,0 +1,26 @@
+name: Keep alive
+
+# Two free-tier problems, one cron:
+#   * Render free spins down after 15 minutes idle (30-60s cold start).
+#   * Supabase free pauses a project after 7 days of no database activity.
+# /health runs a trivial query, so one ping solves both. Every 10 minutes is
+# ~4,300 requests/month and stays inside Render's 750 instance-hours.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the API health endpoint
+        run: |
+          if [ -z "${{ secrets.API_BASE_URL }}" ]; then
+            echo "API_BASE_URL secret not set; skipping."
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/body -w "%{http_code}" --max-time 90 \
+            "${{ secrets.API_BASE_URL }}/health")
+          echo "HTTP $code"; cat /tmp/body
+          test "$code" = "200"

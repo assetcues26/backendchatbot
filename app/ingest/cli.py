@@ -1,0 +1,292 @@
+"""Folder sync CLI: ``acues-ingest``.
+
+Bulk-loads a directory of documents and, on later runs, reconciles the
+database with what is on disk -- adding new files, updating changed ones, and
+deleting documents whose source file is gone.
+
+    acues-ingest sync "C:/path/to/Product Doc"
+    acues-ingest sync ./docs --auto-approve      # demo bootstrap only
+    acues-ingest sync ./docs --dry-run
+    acues-ingest status
+
+Idempotent: running it twice makes no embedding calls the second time,
+because unchanged content is detected by hash before any model is invoked.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import uuid
+from pathlib import Path
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.principal import ROLE_ADMIN, Principal
+from app.db.models import Chunk, DocStatus, Document, Role
+from app.db.seed import INTERNAL_TENANT_SLUG, seed_all, suggest_access
+from app.db.session import dispose_engine, get_session_factory
+from app.ingest import pipeline
+from app.ingest.parsers import SUPPORTED_SUFFIXES
+
+# A stable identity for actions taken by the command line rather than a person.
+SYSTEM_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+def _system_principal(tenant_id: uuid.UUID, role_ids: dict[str, int]) -> Principal:
+    return Principal(
+        user_id=SYSTEM_USER_ID,
+        email="cli@assetcues.local",
+        tenant_id=tenant_id,
+        tenant_slug=INTERNAL_TENANT_SLUG,
+        role_ids=frozenset({role_ids[ROLE_ADMIN]}),
+        role_keys=frozenset({ROLE_ADMIN}),
+        clearance=4,
+    )
+
+
+def discover(root: Path) -> list[Path]:
+    if not root.exists():
+        raise SystemExit(f"error: path does not exist: {root}")
+    if root.is_file():
+        return [root]
+    return sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_SUFFIXES
+        and not p.name.startswith("~$")  # Word lock files
+    )
+
+
+def source_key_for(path: Path, root: Path) -> str:
+    """Path relative to the sync root, so a rename is a delete plus an add."""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
+
+async def cmd_sync(args: argparse.Namespace) -> int:
+    root = Path(args.path).resolve()
+    files = discover(root)
+    if not files:
+        print(f"No supported documents found under {root}")
+        return 1
+
+    print(f"Found {len(files)} document(s) under {root}\n")
+
+    factory = get_session_factory()
+    async with factory() as session:
+        tenant_id, role_ids = await seed_all(session)
+        principal = _system_principal(tenant_id, role_ids)
+
+        created = updated = unchanged = failed = 0
+        reused_total = embedded_total = 0
+        seen_keys: set[str] = set()
+
+        for path in files:
+            key = source_key_for(path, root)
+            seen_keys.add(key)
+            module = path.parent.name if path.parent != root else ""
+
+            if args.dry_run:
+                print(f"  [dry-run] would ingest {key}")
+                continue
+
+            try:
+                result = await pipeline.ingest_path(
+                    session,
+                    path,
+                    tenant_id=tenant_id,
+                    source_key=key,
+                    module=module,
+                    principal=principal,
+                    run_classifier=not args.no_classifier,
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad file must not stop the run
+                await session.rollback()
+                failed += 1
+                print(f"  FAILED   {key}: {type(exc).__name__}: {exc}")
+                continue
+
+            embedded_total += result.chunks_embedded
+            reused_total += result.chunks_reused
+
+            if result.action == "created":
+                created += 1
+            elif result.action == "updated":
+                updated += 1
+            else:
+                unchanged += 1
+
+            if args.auto_approve and result.action in {"created", "updated"}:
+                await _auto_approve(session, result.document_id, path, principal)
+
+            note = ""
+            if result.chunks_reused:
+                note = f" ({result.chunks_reused} embeddings reused)"
+            print(
+                f"  {result.action:<9} {key}  "
+                f"[{result.chunks_total} chunks]{note}"
+            )
+
+            await session.commit()
+
+        removed = 0
+        if not args.dry_run and not args.no_delete:
+            removed = await _remove_missing(session, tenant_id, seen_keys, principal)
+            await session.commit()
+
+    print(
+        f"\ncreated={created} updated={updated} unchanged={unchanged} "
+        f"deleted={removed} failed={failed}"
+    )
+    print(f"embeddings computed={embedded_total} reused={reused_total}")
+    if not args.auto_approve and (created or updated):
+        print(
+            "\nDocuments are in PENDING_REVIEW and readable by nobody. "
+            "Approve them in the admin panel, or re-run with --auto-approve "
+            "to apply the default access matrix."
+        )
+    return 0 if failed == 0 else 2
+
+
+async def _auto_approve(
+    session: AsyncSession,
+    document_id: uuid.UUID,
+    path: Path,
+    principal: Principal,
+) -> None:
+    """Apply the seeded access matrix without a human.
+
+    Convenience for bootstrapping the demo from a known-good folder. It is
+    off by default and every approval is still written to the audit log, so
+    there is a record that a machine and not a person made the decision.
+    """
+    doc = (
+        await session.execute(select(Document).where(Document.id == document_id))
+    ).scalar_one()
+    sensitivity, role_keys = suggest_access(doc.doc_type, path.name)
+    await pipeline.approve_document(session, doc, role_keys, sensitivity, principal)
+
+
+async def _remove_missing(
+    session: AsyncSession,
+    tenant_id: uuid.UUID,
+    seen_keys: set[str],
+    principal: Principal,
+) -> int:
+    """Delete documents whose source file no longer exists.
+
+    This is the half of the pipeline people forget. Without it, deleting a
+    confidential file from the folder leaves it fully retrievable.
+    """
+    rows = (
+        await session.execute(
+            select(Document).where(Document.tenant_id == tenant_id)
+        )
+    ).scalars().all()
+
+    removed = 0
+    for doc in rows:
+        if doc.source_key in seen_keys:
+            continue
+        count = await pipeline.delete_document(session, doc, principal)
+        print(f"  deleted   {doc.source_key}  [{count} chunks removed]")
+        removed += 1
+    return removed
+
+
+async def cmd_status(_: argparse.Namespace) -> int:
+    factory = get_session_factory()
+    async with factory() as session:
+        total = (
+            await session.execute(select(func.count()).select_from(Document))
+        ).scalar_one()
+        chunks = (
+            await session.execute(select(func.count()).select_from(Chunk))
+        ).scalar_one()
+        orphans = (
+            await session.execute(
+                select(func.count())
+                .select_from(Chunk)
+                .where(~Chunk.document_id.in_(select(Document.id)))
+            )
+        ).scalar_one()
+
+        print(f"documents: {total}")
+        print(f"chunks:    {chunks}")
+        print(f"orphaned chunks: {orphans}" + ("  <-- BUG" if orphans else "  (good)"))
+
+        print("\nby status:")
+        for st in DocStatus:
+            n = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Document)
+                    .where(Document.status == st)
+                )
+            ).scalar_one()
+            if n:
+                print(f"  {st.value:<16} {n}")
+
+        roles = (await session.execute(select(Role).order_by(Role.key))).scalars().all()
+        if roles:
+            print("\nroles:")
+            for r in roles:
+                print(f"  {r.key:<14} clearance={r.clearance}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="acues-ingest",
+        description="Sync a folder of documents into the AssetCues assistant.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sync = sub.add_parser("sync", help="ingest a folder and reconcile deletions")
+    sync.add_argument("path", help="file or directory to sync")
+    sync.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="apply the default access matrix instead of leaving documents "
+        "in the review queue (demo bootstrap only)",
+    )
+    sync.add_argument(
+        "--no-delete",
+        action="store_true",
+        help="do not remove documents whose source file has disappeared",
+    )
+    sync.add_argument(
+        "--no-classifier",
+        action="store_true",
+        help="skip the LLM classification pass (no model calls)",
+    )
+    sync.add_argument("--dry-run", action="store_true", help="list actions only")
+    sync.set_defaults(func=cmd_sync)
+
+    status = sub.add_parser("status", help="show what is in the database")
+    status.set_defaults(func=cmd_status)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    async def run() -> int:
+        try:
+            result: int = await args.func(args)
+            return result
+        finally:
+            await dispose_engine()
+
+    sys.exit(asyncio.run(run()))
+
+
+if __name__ == "__main__":
+    main()

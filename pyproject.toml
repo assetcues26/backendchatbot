@@ -1,0 +1,101 @@
+[project]
+name = "assetcues-chatbot-api"
+version = "0.1.0"
+description = "RBAC-aware document Q&A API for AssetCues product documentation"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pgvector>=0.3.6",
+    "openai>=1.60",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "pypdf>=5.1",
+    "python-jose[cryptography]>=3.3",
+    "httpx>=0.28",
+    "structlog>=24.4",
+    "python-multipart>=0.0.20",
+    "tiktoken>=0.8",
+    "defusedxml>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-python-jose",
+]
+
+[project.scripts]
+acues-ingest = "app.ingest.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+ignore = [
+    # assert is the point of a test file
+    "S101",
+    # `class X(str, Enum)` is deliberate, not a missed StrEnum. The Postgres
+    # enum labels are the member NAMES and the raw SQL in app/rag/retrieval.py
+    # matches them literally, so this declaration is load-bearing.
+    "UP042",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# `Depends(...)` in a default argument is the FastAPI idiom, not the mutable
+# default-argument bug B008 is looking for.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.File",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Path",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The migration is generated from the model metadata; its SQL is not dynamic.
+"migrations/versions/*.py" = ["E501"]
+# Retrieval composes one module-level SQL constant into another. No value here
+# comes from a request -- every caller-supplied value is a bound parameter.
+"app/rag/retrieval.py" = ["S608"]
+# Placeholder credentials that exist so unit tests can import the settings.
+"tests/conftest.py" = ["S105", "S106"]
+# Canary strings planted in fixture documents so a leak is unambiguous.
+# They are the opposite of credentials: they exist to be searched for.
+"tests/security/test_rbac_leakage.py" = ["S105"]
+# The CLI owns its event loop and serves one operator; there is no request
+# latency for a filesystem stat to affect.
+"app/ingest/cli.py" = ["ASYNC240"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+# SQLAlchemy dynamic attrs and third-party stubs we don't control
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a live Postgres with pgvector (set DATABASE_URL)",
+    "llm: makes real OpenAI API calls (costs money, needs OPENAI_API_KEY)",
+]
