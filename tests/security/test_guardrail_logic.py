@@ -20,7 +20,12 @@ from app.db.seed import (
 from app.ingest.classifier import _ROLE_CLEARANCE, _normalise
 from app.ingest.parsers import ParsedDocument
 from app.rag import answer as answer_service
-from app.rag.guardrails import detect_injection, extract_citations, validate_citations
+from app.rag.guardrails import (
+    detect_injection,
+    extract_citations,
+    strip_citations,
+    validate_citations,
+)
 from app.rag.prompts import REFUSAL_TEXT, build_system_prompt, build_user_prompt
 from app.rag.retrieval import RetrievedChunk
 
@@ -319,3 +324,91 @@ def test_refusal_does_not_disclose_that_restricted_documents_exist() -> None:
     for leak in ("restricted", "classified", "not authorised", "not authorized",
                  "permission denied", "confidential", "documents matching"):
         assert leak not in lowered
+
+
+# ---------------------------------------------------------------------------
+# G6 - proportionate response to a sourcing failure
+# ---------------------------------------------------------------------------
+
+
+def test_a_partly_traceable_answer_keeps_its_valid_citations() -> None:
+    """One bad ordinal must not discard an otherwise sourced answer.
+
+    Observed on the real corpus: the model cited a document Sales was fully
+    authorised for, but invented a chunk ordinal inside it. Retracting the
+    whole answer told Sales "I don't have information available to you",
+    which was false and would have sent them to request access they held.
+    """
+    doc = uuid.uuid4()
+    chunks = [make_chunk(doc, 7)]
+    good = chunks[0].citation_key
+    answer = f"A Profile has one Access Category [{good}]. It may be edited [{str(doc)[:8]}#43]."
+
+    check = validate_citations(answer, chunks, refusal_text=REFUSAL_TEXT)
+    assert not check.ok
+    assert check.has_traceable_support
+    assert check.valid == {good.lower()}
+
+    cleaned = strip_citations(answer, check.invalid)
+    assert good in cleaned
+    assert "#43" not in cleaned
+    assert "A Profile has one Access Category" in cleaned
+
+
+def test_an_answer_with_no_traceable_citation_has_no_support() -> None:
+    chunks = [make_chunk(uuid.uuid4(), 7)]
+    check = validate_citations(
+        "The envelope is a ceiling [deadbeef#1].", chunks, refusal_text=REFUSAL_TEXT
+    )
+    assert not check.has_traceable_support
+
+
+def test_stripping_removes_the_bracket_when_nothing_survives() -> None:
+    answer = "A claim [deadbeef#9]."
+    cleaned = strip_citations(answer, {"deadbeef#9"})
+    assert "[" not in cleaned
+    assert cleaned.strip() == "A claim."
+
+
+def test_stripping_keeps_the_survivors_inside_a_shared_bracket() -> None:
+    doc = uuid.uuid4()
+    chunks = [make_chunk(doc, 3)]
+    good = chunks[0].citation_key
+    cleaned = strip_citations(f"Both [{good}, deadbeef#9].", {"deadbeef#9"})
+    assert good in cleaned
+    assert "deadbeef" not in cleaned
+
+
+def test_the_unverified_message_does_not_claim_the_reader_lacks_access() -> None:
+    """A sourcing failure is not a permission problem; saying so misinforms."""
+    from app.rag.prompts import UNVERIFIED_TEXT
+
+    assert UNVERIFIED_TEXT != REFUSAL_TEXT
+    lowered = UNVERIFIED_TEXT.lower()
+    assert "available to you" not in lowered
+    assert "request access" not in lowered
+
+
+def test_the_license_user_manual_is_not_customer_visible() -> None:
+    """Classifying by document type breaks on mixed-audience documents.
+
+    This file is titled "User Manual" but its masthead says "Applies to:
+    AssetCues, partner and customer roles", and it documents the internal
+    subscription portal and the backend-only Entitlement Reduction path. The
+    type rule sent it to customers. The LLM classifier caught this and the
+    deterministic matrix did not.
+    """
+    sensitivity, roles = suggest_access(
+        "User Manual", "AssetCues_License_Management_User_Manual_v1.1.docx"
+    )
+    assert sensitivity == 3
+    assert "customer" not in roles
+    assert "sales" in roles
+
+
+def test_ordinary_user_manuals_still_reach_customers() -> None:
+    """The override must be narrow, not a blanket retreat from customers."""
+    _, roles = suggest_access(
+        "User Manual", "Reporting Period Management - User Manual.docx"
+    )
+    assert "customer" in roles

@@ -49,6 +49,7 @@ Seed data in `app/db/seed.py`, overridable per document by an admin.
 | Test Cases | 3 | Y | Y | Y | – | – | – |
 | Validation & Governance Pack | 3 | Y | Y | Y | – | – | – |
 | **License Management BRD** *(override)* | **4** | Y | Y | – | Y | – | – |
+| **License Management User Manual** *(override)* | **3** | Y | Y | – | Y | Y | – |
 | *anything unrecognised* | 4 | – | – | – | – | – | – |
 
 `admin` is granted everything and is omitted from the table.
@@ -71,6 +72,16 @@ the License *Test Cases* at level 3.
 
 **User guides are the only category that reaches Customer.** Without them the
 customer-facing half of the product does not exist.
+
+**The License Management User Manual is an override, not a type rule.** It is
+titled "User Manual" and the type rule therefore sent it to customers. Its
+own masthead reads *"Applies to: AssetCues, partner and customer roles"*,
+and it documents the internal subscription portal, the partner allocation
+portal and the backend-only Entitlement Reduction path. Classifying by
+document type assumes a user manual is written for users; a mixed-audience
+document breaks that assumption, and only reading it catches the problem.
+The LLM classifier flagged this file as restricted when the deterministic
+matrix did not — the strongest argument in this system for keeping both.
 
 **Unrecognised types default to RESTRICTED, admin only.** Default-deny.
 

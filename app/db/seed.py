@@ -138,11 +138,27 @@ DOC_TYPE_ACCESS: dict[str, tuple[int, tuple[str, ...]]] = {
 
 # Overrides keyed by a case-insensitive substring of the source filename.
 # Checked before DOC_TYPE_ACCESS.
+#
+# These exist because classifying by document *type* has a real limit: it
+# assumes a "User Manual" is written for users. A mixed-audience document
+# breaks that assumption, and the only safe way to catch it is to read the
+# document.
 FILENAME_ACCESS_OVERRIDES: tuple[tuple[str, int, tuple[str, ...]], ...] = (
     (
         "license_management_brd",
         int(Sensitivity.RESTRICTED),
         ("admin", "product", "engineering", "sales"),
+    ),
+    (
+        # Titled "User Manual", but its own masthead reads "Applies to:
+        # AssetCues, partner and customer roles" and it documents the internal
+        # subscription portal, the partner allocation portal and the
+        # backend-only Entitlement Reduction path. The type-based rule sent it
+        # to customers; reading it shows that is wrong. Internal only until
+        # AssetCues publishes a customer-only edition.
+        "license_management_user_manual",
+        int(Sensitivity.INTERNAL),
+        ("admin", "product", "engineering", "sales", "support"),
     ),
 )
 

@@ -11,8 +11,9 @@ safe, because the only text the model can draw on is the context we gave it,
 and that context was already restricted to documents this caller may read.
 G6 does not catch unauthorised *content* -- G3 and G4 make unauthorised
 content unreachable. G6 catches an answer that cites a source it was not
-given, which is a correctness failure, not a disclosure. When it fires we
-retract the answer rather than let an untraceable claim stand.
+given, which is a correctness failure, not a disclosure. Its response is
+graded accordingly: bad citation markers are stripped while any traceable
+claim remains, and the answer is withheld only when nothing can be traced.
 """
 
 from __future__ import annotations
@@ -157,19 +158,42 @@ async def _finalise(
     injection = guardrails.scan_chunks_for_injection(context.chunks)
     latency = int((time.time() - started) * 1000)
 
-    retracted = not check.ok
-    answer = prompts.REFUSAL_TEXT if retracted else raw_answer
+    # G6, proportionately.
+    #
+    # An untraceable citation is a sourcing failure, not a disclosure -- the
+    # content itself was already bounded to authorised chunks by G3 and G4. The
+    # common case is the model naming a real, authorised document but inventing
+    # a chunk ordinal within it. Discarding an otherwise correct answer for
+    # that, and telling the reader "I don't have information available to you",
+    # states something false about their access.
+    #
+    # So: if any claim is still traceable, drop the bad markers and keep the
+    # answer. Retract only when nothing at all can be traced.
+    retracted = False
+    answer = raw_answer
+    if not check.ok:
+        if check.has_traceable_support:
+            answer = guardrails.strip_citations(raw_answer, check.invalid)
+        else:
+            retracted = True
+            answer = prompts.UNVERIFIED_TEXT
+
     is_refusal = answer.strip() == prompts.REFUSAL_TEXT.strip()
 
-    if retracted:
+    # Audit every sourcing failure, repaired or not. A rising count of
+    # repaired answers is the signal that the model is drifting on citation
+    # format, and it would be invisible if only retractions were recorded.
+    if not check.ok:
         await audit.record(
             session,
             audit.Event.CITATION_REJECTED,
             principal=principal,
-            severity="warning",
+            severity="warning" if retracted else "info",
             question=question[:500],
             reason=check.failure_reason,
             invalid_keys=sorted(check.invalid),
+            valid_keys=sorted(check.valid),
+            outcome="retracted" if retracted else "invalid_citations_stripped",
         )
 
     if injection:
@@ -212,7 +236,11 @@ async def _finalise(
 
     return AnswerResult(
         answer=answer,
-        citations=[] if retracted or is_refusal else build_citations(context.chunks, check.cited),
+        citations=(
+            []
+            if retracted or is_refusal
+            else build_citations(context.chunks, check.valid)
+        ),
         refused=is_refusal,
         retracted=retracted,
         latency_ms=latency,
@@ -317,7 +345,10 @@ async def stream_answer(
     cache_put(key, result)
 
     if result.retracted:
-        yield "retracted", {"answer": result.answer, "reason": "citation_check_failed"}
+        yield "retracted", {
+            "answer": result.answer,
+            "reason": "no claim in the answer could be traced to a source",
+        }
         return
 
     yield "done", {

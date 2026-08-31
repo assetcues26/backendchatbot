@@ -29,6 +29,16 @@ REFUSAL_TEXT = (
     "administrator will review it."
 )
 
+# Used when an answer could not be traced to the excerpts it was given.
+# Deliberately NOT the refusal wording: the reader may well have access,
+# and telling them otherwise sends them to request permissions they
+# already hold.
+UNVERIFIED_TEXT = (
+    "I could not produce an answer I can trace back to the source "
+    "documents, so I have withheld it rather than show something "
+    "unverified. Please rephrase the question and try again."
+)
+
 _ROLE_DESCRIPTIONS = {
     "admin": "a system administrator",
     "engineering": "a member of the Engineering team",

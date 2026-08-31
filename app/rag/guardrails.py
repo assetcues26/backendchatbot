@@ -46,8 +46,14 @@ _INJECTION_PATTERNS = [
 class CitationCheck:
     ok: bool
     cited: set[str]
+    valid: set[str]
     invalid: set[str]
     uncited: bool  # answer made claims but cited nothing
+
+    @property
+    def has_traceable_support(self) -> bool:
+        """At least one claim can be traced to supplied evidence."""
+        return bool(self.valid)
 
     @property
     def failure_reason(self) -> str:
@@ -56,6 +62,25 @@ class CitationCheck:
         if self.uncited:
             return "answer contained substantive content with no citation"
         return ""
+
+
+def strip_citations(answer: str, keys: set[str]) -> str:
+    """Remove citation markers for the given keys, tidying any empty brackets."""
+    if not keys:
+        return answer
+    lowered = {k.lower() for k in keys}
+
+    def replace(match: re.Match[str]) -> str:
+        kept = [
+            k.strip()
+            for k in match.group(1).split(",")
+            if k.strip().lower() not in lowered
+        ]
+        return f"[{', '.join(kept)}]" if kept else ""
+
+    cleaned = _CITATION_BLOCK.sub(replace, answer)
+    # Collapse the double spaces a removed marker leaves behind.
+    return re.sub(r" {2,}", " ", cleaned).replace(" .", ".").replace(" ,", ",")
 
 
 def extract_citations(answer: str) -> set[str]:
@@ -77,6 +102,7 @@ def validate_citations(
     allowed = {c.citation_key.lower() for c in chunks}
     cited = extract_citations(answer)
     invalid = cited - allowed
+    valid = cited & allowed
 
     stripped = answer.strip()
     is_refusal = stripped == refusal_text.strip() or not stripped
@@ -87,6 +113,7 @@ def validate_citations(
     return CitationCheck(
         ok=not invalid and not uncited,
         cited=cited,
+        valid=valid,
         invalid=invalid,
         uncited=uncited,
     )
