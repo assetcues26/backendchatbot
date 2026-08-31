@@ -38,6 +38,7 @@ class Event:
     USER_DISABLED = "user_disabled"
     ACCESS_REQUESTED = "access_requested"
     LOGIN = "login"
+    FEEDBACK = "feedback"
 
 
 async def record(
@@ -48,20 +49,25 @@ async def record(
     document_id: uuid.UUID | None = None,
     severity: str = "info",
     **detail: Any,
-) -> None:
-    """Write one audit row. Never raises into the caller's happy path."""
-    session.add(
-        AuditEvent(
-            event_type=event_type,
-            actor_user_id=principal.user_id if principal else None,
-            actor_email=principal.email if principal else "",
-            tenant_id=principal.tenant_id if principal else None,
-            actor_role_keys=sorted(principal.role_keys) if principal else [],
-            document_id=document_id,
-            severity=severity,
-            detail=detail,
-        )
+) -> AuditEvent:
+    """Write one audit row and return it.
+
+    The row is returned so a caller can reference it afterwards -- feedback
+    points at the query event by id, which is what keeps the recorded question
+    and sources server-derived rather than whatever a client claims they were.
+    """
+    event = AuditEvent(
+        event_type=event_type,
+        actor_user_id=principal.user_id if principal else None,
+        actor_email=principal.email if principal else "",
+        tenant_id=principal.tenant_id if principal else None,
+        actor_role_keys=sorted(principal.role_keys) if principal else [],
+        document_id=document_id,
+        severity=severity,
+        detail=detail,
     )
+    session.add(event)
+    return event
 
 
 async def get_acl_version(session: AsyncSession) -> int:
@@ -91,6 +97,22 @@ async def bump_acl_version(session: AsyncSession) -> int:
     state.acl_version += 1
     await session.flush()
     return int(state.acl_version)
+
+
+async def count_feedback(session: AsyncSession, rating: str) -> int:
+    """How many answers were rated up or down."""
+    return int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.event_type == Event.FEEDBACK,
+                    AuditEvent.detail["rating"].astext == rating,
+                )
+            )
+        ).scalar_one()
+    )
 
 
 async def count_events(session: AsyncSession, event_type: str) -> int:

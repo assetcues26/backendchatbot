@@ -48,6 +48,9 @@ class Citation:
 @dataclass(slots=True)
 class AnswerResult:
     answer: str
+    # Id of this query's audit row. Feedback points at it, so the recorded
+    # question and sources come from the server rather than the client.
+    turn_id: str = ""
     citations: list[Citation] = field(default_factory=list)
     follow_ups: list[str] = field(default_factory=list)
     refused: bool = False
@@ -313,7 +316,7 @@ async def _finalise(
             detail_text=anomaly,
         )
 
-    await audit.record(
+    query_event = await audit.record(
         session,
         audit.Event.QUERY_REFUSED if is_refusal else audit.Event.QUERY,
         principal=principal,
@@ -333,6 +336,7 @@ async def _finalise(
 
     return AnswerResult(
         answer=answer,
+        turn_id=str(query_event.id),
         citations=(
             []
             if retracted or is_refusal
@@ -413,6 +417,7 @@ async def stream_answer(
     if hit is not None:
         yield "delta", hit.answer
         yield "done", {
+            "turn_id": hit.turn_id,
             "citations": [asdict(c) for c in hit.citations],
             "follow_ups": hit.follow_ups,
             "refused": hit.refused,
@@ -430,6 +435,7 @@ async def stream_answer(
         cache_put(key, result)
         yield "delta", result.answer
         yield "done", {
+            "turn_id": result.turn_id,
             "citations": [],
             "follow_ups": [],
             "refused": True,
@@ -475,6 +481,7 @@ async def stream_answer(
         return
 
     yield "done", {
+        "turn_id": result.turn_id,
         "citations": [asdict(c) for c in result.citations],
         "follow_ups": result.follow_ups,
         "refused": result.refused,

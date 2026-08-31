@@ -60,6 +60,7 @@ class CitationOut(BaseModel):
 
 class AnswerOut(BaseModel):
     answer: str
+    turn_id: str = ""
     citations: list[CitationOut] = []
     follow_ups: list[str] = []
     refused: bool = False
@@ -86,6 +87,24 @@ class RoleComparisonOut(BaseModel):
     question: str
     entries: list[RoleComparisonEntry]
     total_matching_chunks: int
+
+
+class FeedbackIn(BaseModel):
+    """A thumbs up or down on one answer.
+
+    `turn_id` is the audit row the query already wrote. The question, the
+    documents used and the asker are read back from that row rather than
+    accepted here, so feedback cannot be filed against a query that never
+    happened or attributed to someone else. The answer text is supplied by the
+    client because the server does not retain transcripts; it is stored only
+    when someone asks for this answer to be reviewed, and is recorded as
+    client-reported.
+    """
+
+    turn_id: uuid.UUID
+    rating: str = Field(pattern="^(up|down)$")
+    comment: str = Field(default="", max_length=1000)
+    answer: str = Field(default="", max_length=8000)
 
 
 class AccessRequestIn(BaseModel):
@@ -256,6 +275,8 @@ class AuditEventOut(BaseModel):
 
 class AuditSummaryOut(BaseModel):
     total_queries: int
+    feedback_up: int = 0
+    feedback_down: int = 0
     total_refusals: int
     total_anomalies: int
     total_retractions: int

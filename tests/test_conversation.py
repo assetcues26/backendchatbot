@@ -96,3 +96,59 @@ async def test_no_history_means_no_rewrite_and_no_model_call() -> None:
 async def test_blank_history_entries_are_ignored() -> None:
     question = "What are the six Access Categories?"
     assert await condense_question(question, ["  ", ""]) == question
+
+
+# ---------------------------------------------------------------------------
+# Answer feedback
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_references_a_turn_rather_than_restating_it() -> None:
+    """The question and sources must come from the server's own audit row.
+
+    If the client supplied them, feedback could be filed against a question
+    nobody asked. `turn_id` is the query's audit row; the route reads the rest
+    back from it.
+    """
+    from app.api.schemas import FeedbackIn
+
+    assert "turn_id" in FeedbackIn.model_fields
+    assert "question" not in FeedbackIn.model_fields
+    assert "documents_used" not in FeedbackIn.model_fields
+
+
+def test_feedback_carries_no_identity_claim() -> None:
+    """G2 again: who filed it comes from the JWT, not the body."""
+    from app.api.schemas import FeedbackIn
+
+    forbidden = {"role", "roles", "tenant_id", "clearance", "user_id", "email"}
+    assert not (set(FeedbackIn.model_fields) & forbidden)
+
+
+@pytest.mark.parametrize("rating", ["up", "down"])
+def test_valid_ratings_are_accepted(rating: str) -> None:
+    from app.api.schemas import FeedbackIn
+
+    assert FeedbackIn(turn_id=uuid.uuid4(), rating=rating).rating == rating
+
+
+def test_an_arbitrary_rating_is_rejected() -> None:
+    from app.api.schemas import FeedbackIn
+
+    with pytest.raises(ValueError):
+        FeedbackIn(turn_id=uuid.uuid4(), rating="sideways")
+
+
+def test_a_turn_id_must_be_a_real_identifier() -> None:
+    from app.api.schemas import FeedbackIn
+
+    with pytest.raises(ValueError):
+        FeedbackIn(turn_id="not-a-uuid", rating="up")
+
+
+def test_the_answer_field_is_bounded() -> None:
+    """Client-reported text still goes in the audit log; cap what it can be."""
+    from app.api.schemas import FeedbackIn
+
+    with pytest.raises(ValueError):
+        FeedbackIn(turn_id=uuid.uuid4(), rating="down", answer="x" * 8001)

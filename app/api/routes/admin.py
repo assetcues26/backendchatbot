@@ -550,6 +550,8 @@ async def audit_summary(
 ) -> AuditSummaryOut:
     return AuditSummaryOut(
         total_queries=await audit.count_events(session, audit.Event.QUERY),
+        feedback_up=await audit.count_feedback(session, "up"),
+        feedback_down=await audit.count_feedback(session, "down"),
         total_refusals=await audit.count_events(session, audit.Event.QUERY_REFUSED),
         total_anomalies=await audit.count_events(session, audit.Event.SECURITY_ANOMALY),
         total_retractions=await audit.count_events(

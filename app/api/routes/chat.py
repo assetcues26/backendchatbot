@@ -22,6 +22,7 @@ from app.api.schemas import (
     AnswerOut,
     AskRequest,
     CitationOut,
+    FeedbackIn,
     MeOut,
     RoleComparisonEntry,
     RoleComparisonOut,
@@ -30,7 +31,7 @@ from app.core import audit
 from app.core.principal import Principal
 from app.core.rate_limit import enforce_rate_limit
 from app.core.security import current_principal, require_admin
-from app.db.models import AccessRequest, Role, Tenant, User
+from app.db.models import AccessRequest, AuditEvent, Role, Tenant, User
 from app.db.session import get_session
 from app.rag import answer as answer_service
 
@@ -74,6 +75,7 @@ async def ask(
     )
     return AnswerOut(
         answer=result.answer,
+        turn_id=result.turn_id,
         citations=[CitationOut(**asdict(c)) for c in result.citations],
         follow_ups=result.follow_ups,
         refused=result.refused,
@@ -114,6 +116,65 @@ async def ask_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/feedback", status_code=status.HTTP_201_CREATED)
+async def submit_feedback(
+    payload: FeedbackIn,
+    principal: Principal = Depends(current_principal),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    """Record a thumbs up or down against an answer.
+
+    The question, the documents used and the roles in play are read back from
+    the query's own audit row, not taken from the request. A client could
+    otherwise file feedback against a question nobody asked, or against
+    someone else's query.
+    """
+    original = (
+        await session.execute(
+            select(AuditEvent).where(
+                AuditEvent.id == payload.turn_id,
+                AuditEvent.event_type.in_(
+                    [audit.Event.QUERY, audit.Event.QUERY_REFUSED]
+                ),
+            )
+        )
+    ).scalar_one_or_none()
+
+    if original is None:
+        raise HTTPException(status_code=404, detail="No such answer")
+
+    # Feedback belongs to the person who asked. Anything else lets one user
+    # attach opinions to another user's conversation.
+    if original.actor_user_id != principal.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only rate your own answers",
+        )
+
+    detail = original.detail or {}
+    await audit.record(
+        session,
+        audit.Event.FEEDBACK,
+        principal=principal,
+        severity="warning" if payload.rating == "down" else "info",
+        rating=payload.rating,
+        comment=payload.comment[:1000],
+        turn_id=str(payload.turn_id),
+        asked_at=original.created_at.isoformat(),
+        # Server-derived, from the original query row.
+        question=detail.get("question", ""),
+        documents_used=detail.get("documents_used", []),
+        chunks_used=detail.get("chunks_used", 0),
+        was_refused=original.event_type == audit.Event.QUERY_REFUSED,
+        # Client-reported: the server keeps no transcript, so this is the only
+        # record of what was actually shown. Stored because the person asked
+        # for this answer to be looked at.
+        answer_as_shown=payload.answer[:8000],
+    )
+    await session.commit()
+    return {"status": "recorded", "rating": payload.rating}
 
 
 @router.post("/access-request", status_code=status.HTTP_201_CREATED)
