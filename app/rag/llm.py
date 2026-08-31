@@ -72,12 +72,25 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     client = get_client()
     out: list[list[float]] = []
 
+    # The v3 embedding models are Matryoshka-trained, so asking for fewer
+    # dimensions is a principled truncation rather than a lossy chop. We use
+    # text-embedding-3-large at 1536 instead of its native 3072 because
+    # pgvector caps HNSW indexes at 2000 dimensions -- a vector(3072) column
+    # would fall back to a sequential scan on every query. The quality cost is
+    # ~0.3 MTEB points; the quality gain over 3-small at the same width is
+    # ~2 points. Older models (ada-002) reject the parameter.
+    supports_dimensions = settings.openai_embedding_model.startswith(
+        "text-embedding-3"
+    )
+
     for start in range(0, len(texts), _EMBED_BATCH_SIZE):
         batch = texts[start : start + _EMBED_BATCH_SIZE]
+        extra = {"dimensions": settings.embedding_dim} if supports_dimensions else {}
         response = await _with_retry(
             client.embeddings.create,
             model=settings.openai_embedding_model,
             input=batch,
+            **extra,
         )
         # The API returns items in input order, but it also carries an explicit
         # index. Sort by it rather than trusting position.

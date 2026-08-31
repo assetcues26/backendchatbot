@@ -81,6 +81,7 @@ async def _document_out(session: AsyncSession, doc: Document) -> DocumentOut:
         doc_type=doc.doc_type,
         status=doc.status.value,
         sensitivity=doc.sensitivity,
+        is_shared=doc.is_shared,
         version=doc.version,
         byte_size=doc.byte_size,
         declared_audience=list(doc.declared_audience or []),

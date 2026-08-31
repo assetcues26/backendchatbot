@@ -227,23 +227,54 @@ async def test_an_explicit_deny_beats_a_role_grant(session, world) -> None:
 async def test_an_explicit_allow_grants_one_document_without_a_role(
     session, world
 ) -> None:
-    user = world["users"]["support"]
+    """An ALLOW grants a document the role ACL does not, within clearance.
+
+    Sales has clearance 4 but no ACL row for the QA validation pack. An
+    explicit grant should reach it.
+    """
+    user = world["users"]["sales"]
     principal = await principal_for(session, user)
-    assert PARTNER_ENVELOPE not in await search_as(
-        session, principal, SEARCH["envelope"]
-    )
+    assert TEST_CASE_ID not in await search_as(session, principal, SEARCH["testcase"])
 
     session.add(
         UserDocumentGrant(
             user_id=user.id,
-            document_id=world["docs"]["license_brd"].id,
+            document_id=world["docs"]["uam_tests"].id,
             effect=GrantEffect.ALLOW,
             reason="temporary escalation",
         )
     )
     await session.commit()
 
-    assert PARTNER_ENVELOPE in await search_as(session, principal, SEARCH["envelope"])
+    assert TEST_CASE_ID in await search_as(session, principal, SEARCH["testcase"])
+
+
+async def test_an_explicit_allow_cannot_breach_the_clearance_ceiling(
+    session, world
+) -> None:
+    """The two conditions are independent: a grant is not a clearance override.
+
+    Support sits at clearance 3. Granting them the level-4 License BRD must
+    still fail, otherwise the ceiling is decorative and a single mis-click
+    could hand out commercial material.
+    """
+    user = world["users"]["support"]
+    principal = await principal_for(session, user)
+    assert principal.clearance == 3
+
+    session.add(
+        UserDocumentGrant(
+            user_id=user.id,
+            document_id=world["docs"]["license_brd"].id,
+            effect=GrantEffect.ALLOW,
+            reason="mistaken escalation",
+        )
+    )
+    await session.commit()
+
+    assert PARTNER_ENVELOPE not in await search_as(
+        session, principal, SEARCH["envelope"]
+    )
 
 
 async def test_an_expired_allow_grant_does_not_apply(session, world) -> None:
@@ -357,9 +388,14 @@ async def test_retrieval_and_reverification_never_disagree(session, world, role)
 async def test_blocked_documents_are_reported_for_the_audit_trail(
     session, world
 ) -> None:
-    """The audit console needs to know what was withheld, even though the
-    user is never told."""
-    principal = await principal_for(session, world["users"]["customer"])
+    """The audit console needs to know what was withheld, though the user is
+    never told.
+
+    Support is used rather than a customer because the report is scoped to
+    documents inside the caller's reach. Naming another tenant's documents in
+    the audit log would itself be a cross-tenant disclosure.
+    """
+    principal = await principal_for(session, world["users"]["support"])
     result = await retrieve(
         session, principal, SEARCH["envelope"], fake_embedding(SEARCH["envelope"]),
         top_k=12, candidates=50, rrf_k=60, collect_blocked=True,
@@ -367,6 +403,18 @@ async def test_blocked_documents_are_reported_for_the_audit_trail(
     assert not any(PARTNER_ENVELOPE in c.text for c in result.chunks)
     assert any("License" in b.title for b in result.blocked)
     assert result.blocked_chunk_count > 0
+
+
+async def test_a_customer_is_never_told_about_another_tenants_documents(
+    session, world
+) -> None:
+    """The withheld-documents report must not cross the tenant boundary."""
+    principal = await principal_for(session, world["users"]["customer"])
+    result = await retrieve(
+        session, principal, "asset class identifier", fake_embedding("asset class"),
+        top_k=12, candidates=50, rrf_k=60, collect_blocked=True,
+    )
+    assert not any("Globex" in b.title for b in result.blocked)
 
 
 # ---------------------------------------------------------------------------

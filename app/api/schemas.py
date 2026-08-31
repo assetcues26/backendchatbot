@@ -113,6 +113,7 @@ class DocumentOut(BaseModel):
     doc_type: str
     status: str
     sensitivity: int
+    is_shared: bool = False
     version: int
     byte_size: int
     declared_audience: list[str] = []

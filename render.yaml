@@ -41,7 +41,7 @@ services:
       - key: OPENAI_CLASSIFIER_MODEL
         value: gpt-5.6-luna
       - key: OPENAI_EMBEDDING_MODEL
-        value: text-embedding-3-small
+        value: text-embedding-3-large
       - key: EMBEDDING_DIM
         value: "1536"
       - key: RATE_LIMIT_PER_MINUTE

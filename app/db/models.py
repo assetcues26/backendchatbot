@@ -191,6 +191,14 @@ class Document(Base):
         Enum(DocStatus, name="doc_status"), default=DocStatus.PROCESSING, index=True
     )
 
+    # AssetCues product documentation is authored once and read by every
+    # customer, so strict tenant equality would make the customer-facing half
+    # of the product impossible. `is_shared` relaxes the TENANT dimension only:
+    # sensitivity and the role ACL still apply in full, so a shared L3
+    # specification remains invisible to customers (clearance 2, and not in its
+    # ACL). Customer-uploaded material stays tenant-scoped with is_shared=False.
+    is_shared: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
     # Scraped verbatim from the document's own "Primary audience" field.
     declared_audience: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
     # Classifier proposal, held for the admin to accept or override.

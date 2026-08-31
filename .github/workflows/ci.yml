@@ -30,6 +30,9 @@ jobs:
       OPENAI_API_KEY: not-used-tests-use-deterministic-fake-embeddings
       SUPABASE_JWT_SECRET: test-secret
       ENVIRONMENT: development
+      # The security suite drops every table. Safe here: the database is a
+      # throwaway service container that dies with the job.
+      ALLOW_DESTRUCTIVE_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v4

@@ -43,6 +43,8 @@ from app.db.models import (
     DocumentVersion,
     Role,
     Sensitivity,
+    Tenant,
+    TenantKind,
 )
 from app.ingest.chunker import Chunk as TextChunk
 from app.ingest.chunker import chunk_markdown
@@ -233,8 +235,15 @@ async def _create(
     suggested: Classification | None,
     principal: Principal | None,
 ) -> IngestResult:
+    # Product documentation lives in the AssetCues tenant and is read by every
+    # customer; anything uploaded into a customer tenant stays scoped to it.
+    owner_kind = (
+        await session.execute(select(Tenant.kind).where(Tenant.id == tenant_id))
+    ).scalar_one_or_none()
+
     document = Document(
         tenant_id=tenant_id,
+        is_shared=owner_kind == TenantKind.INTERNAL,
         title=parsed.title,
         source_filename=filename,
         source_key=source_key,

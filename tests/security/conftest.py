@@ -23,6 +23,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.principal import Principal
 from app.db.models import (
@@ -61,10 +62,54 @@ def fake_embedding(text_value: str) -> list[float]:
 
 
 def _database_url() -> str | None:
+    """The database to test against, or None to skip.
+
+    The localhost placeholder from tests/conftest.py means "nothing real was
+    configured", so treat it as absent rather than trying to connect and
+    failing with a confusing error.
+    """
     url = os.environ.get("DATABASE_URL", "")
-    if not url or "localhost:5432/db" in url:
+    if not url:
+        return None
+    placeholder = "postgres:postgres@localhost:5432/postgres"
+    if placeholder in url:
         return None
     return url
+
+
+# THIS SUITE IS DESTRUCTIVE. It drops and recreates every table.
+#
+# The same DATABASE_URL serves the app, `alembic upgrade` and `acues-ingest`,
+# so running this against the working database deletes the corpus. Two earlier
+# designs failed: a row-count guard could not tell leftover fixtures from real
+# documents, and a separate Postgres schema was silently defeated by
+# `create_all` finding `public.chunks` through the search_path and creating
+# nothing.
+#
+# So the protection is an explicit opt-in rather than a heuristic. It cannot
+# misfire and it cannot be misread:
+#
+#     ALLOW_DESTRUCTIVE_TESTS=1 pytest tests/security
+#
+# CI sets it because CI runs a throwaway container. Locally, set it only when
+# you are certain the database is scratch.
+_schema_ready = False
+
+# Every table the fixtures write to, ordered so TRUNCATE ... CASCADE is cheap.
+_DATA_TABLES = (
+    "chunks",
+    "document_acl",
+    "user_document_grants",
+    "document_versions",
+    "documents",
+    "user_roles",
+    "users",
+    "tenants",
+    "audit_log",
+    "access_requests",
+    "roles",
+    "system_state",
+)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -73,21 +118,45 @@ async def session() -> AsyncIterator[AsyncSession]:
     if url is None:
         pytest.skip("set DATABASE_URL to a Postgres with pgvector to run these")
 
-    engine = create_async_engine(url, connect_args={"statement_cache_size": 0})
+    if not os.environ.get("ALLOW_DESTRUCTIVE_TESTS"):
+        pytest.skip(
+            "this suite DROPS EVERY TABLE in DATABASE_URL. Re-run with "
+            "ALLOW_DESTRUCTIVE_TESTS=1 once you are sure that database is "
+            "scratch -- never against one holding your documents."
+        )
+
+    global _schema_ready
+    # A new engine per test. pytest-asyncio runs each test on its own event
+    # loop, and asyncpg connections are bound to the loop that opened them, so
+    # a shared pool deadlocks. NullPool keeps nothing to leak across loops.
+    engine = create_async_engine(
+        url, connect_args={"statement_cache_size": 0}, poolclass=NullPool
+    )
 
     try:
         async with engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            await conn.run_sync(Base.metadata.drop_all)
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_chunks_embedding_hnsw ON chunks "
-                    "USING hnsw (embedding vector_cosine_ops)"
+            if not _schema_ready:
+                # Build once per session. Rebuilding per test costs ~70s each
+                # against a remote pooler, and a security suite nobody runs is
+                # decorative.
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                await conn.run_sync(Base.metadata.drop_all)
+                await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_chunks_embedding_hnsw "
+                        "ON chunks USING hnsw (embedding vector_cosine_ops)"
+                    )
                 )
-            )
+                _schema_ready = True
+            else:
+                await conn.execute(
+                    text(
+                        f"TRUNCATE TABLE {', '.join(_DATA_TABLES)} "
+                        f"RESTART IDENTITY CASCADE"
+                    )
+                )
     except Exception as exc:  # pragma: no cover
-        await engine.dispose()
         pytest.skip(f"database unavailable or missing pgvector: {exc}")
 
     factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -96,7 +165,6 @@ async def session() -> AsyncIterator[AsyncSession]:
         await seed_roles(s)
         await s.commit()
         yield s
-
     await engine.dispose()
 
 
@@ -132,6 +200,11 @@ async def world(session: AsyncSession) -> dict[str, object]:
     ) -> Document:
         doc = Document(
             tenant_id=tenant.id,
+            # Mirrors app/ingest/pipeline.py: documentation authored in the
+            # AssetCues tenant is product documentation and reaches every
+            # customer, subject to sensitivity and ACL. Customer-owned
+            # material stays scoped to its tenant.
+            is_shared=tenant.kind == TenantKind.INTERNAL,
             title=title,
             source_filename=f"{name}.docx",
             source_key=f"{name}.docx",
@@ -161,7 +234,6 @@ async def world(session: AsyncSession) -> dict[str, object]:
         for key in role_keys:
             session.add(DocumentACL(document_id=doc.id, role_id=roles[key].id))
 
-        await session.flush()
         docs[name] = doc
         return doc
 
@@ -264,10 +336,8 @@ async def world(session: AsyncSession) -> dict[str, object]:
             id=uuid.uuid4(), tenant_id=tenant.id, email=email, display_name=key
         )
         session.add(user)
-        await session.flush()
         for role_key in role_keys:
             session.add(UserRole(user_id=user.id, role_id=roles[role_key].id))
-        await session.flush()
         users[key] = user
         return user
 

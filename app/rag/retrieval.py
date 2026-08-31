@@ -37,7 +37,10 @@ from app.core.principal import Principal
 # ---------------------------------------------------------------------------
 #
 #   can_read(user, doc) =
-#         doc.tenant_id   == user.tenant_id
+#         user.tenant exists AND is active
+#     AND (   doc.tenant_id == user.tenant_id            <- own tenant
+#          OR (doc.is_shared AND doc.sensitivity <= 2)   <- shared, customer-safe
+#         )
 #     AND doc.status      == 'approved'          <- default-deny (G1)
 #     AND doc.sensitivity <= user.clearance      <- ceiling
 #     AND (role grant OR explicit user allow)    <- positive grant required
@@ -45,12 +48,30 @@ from app.core.principal import Principal
 #
 # Clearance alone never grants access, and a grant alone never bypasses the
 # ceiling. Two independent conditions must both fail before a leak occurs.
+#
+# On the sensitivity cap in the sharing clause: `is_shared` exists so AssetCues
+# product documentation, authored once in the AssetCues tenant, reaches every
+# customer. Without the cap it would also carry INTERNAL and RESTRICTED
+# material across the tenant boundary -- a customer-tenant administrator holds
+# the same global `admin` role as an AssetCues one, so they would have read the
+# License Management BRD. Sharing may widen reach only to customer-safe
+# levels; anything above L2 stays inside its owning tenant, whatever its ACL
+# says.
+
+MAX_CROSS_TENANT_SENSITIVITY = 2  # Sensitivity.CUSTOMER
 
 VISIBLE_DOCS_CTE = """
 visible_docs AS (
     SELECT d.id
     FROM documents d
-    WHERE d.tenant_id = CAST(:tenant_id AS uuid)
+    WHERE EXISTS (
+            SELECT 1 FROM tenants t
+            WHERE t.id = CAST(:tenant_id AS uuid) AND t.is_active
+      )
+      AND (
+            d.tenant_id = CAST(:tenant_id AS uuid)
+         OR (d.is_shared AND d.sensitivity <= 2)
+      )
       AND d.status = 'APPROVED'
       AND d.sensitivity <= :clearance
       AND (
@@ -130,18 +151,32 @@ LIMIT :top_k
 # "how much existed that you could not see". Its results are counted, never
 # returned to a non-admin caller.
 _UNFILTERED_MATCH_SQL = """
-WITH vector_hits AS (
+WITH reachable AS (
+    SELECT d.id
+    FROM documents d
+    WHERE EXISTS (
+            SELECT 1 FROM tenants t
+            WHERE t.id = CAST(:tenant_id AS uuid) AND t.is_active
+      )
+      AND (
+            d.tenant_id = CAST(:tenant_id AS uuid)
+         OR (d.is_shared AND d.sensitivity <= 2)
+      )
+      AND d.status = 'APPROVED'
+),
+vector_hits AS (
     SELECT c.id, c.document_id
     FROM chunks c
-    WHERE c.embedding IS NOT NULL AND c.tenant_id = CAST(:tenant_id AS uuid)
+    JOIN reachable r ON r.id = c.document_id
+    WHERE c.embedding IS NOT NULL
     ORDER BY c.embedding <=> CAST(:qvec AS vector)
     LIMIT :candidates
 ),
 text_hits AS (
     SELECT c.id, c.document_id
     FROM chunks c
-    WHERE c.tenant_id = CAST(:tenant_id AS uuid)
-      AND c.tsv @@ websearch_to_tsquery('english', :query)
+    JOIN reachable r ON r.id = c.document_id
+    WHERE c.tsv @@ websearch_to_tsquery('english', :query)
     LIMIT :candidates
 ),
 all_hits AS (
@@ -152,7 +187,6 @@ all_hits AS (
 SELECT h.document_id, d.title, d.sensitivity, COUNT(*) AS chunk_count
 FROM all_hits h
 JOIN documents d ON d.id = h.document_id
-WHERE d.status = 'APPROVED'
 GROUP BY h.document_id, d.title, d.sensitivity
 """
 
