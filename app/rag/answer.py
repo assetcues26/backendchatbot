@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -262,9 +262,7 @@ async def answer_question(
 
     hit = cache_get(key)
     if hit is not None:
-        cached = AnswerResult(**{**hit.__dict__})
-        cached.cached = True
-        return cached
+        return replace(hit, cached=True)
 
     context, _ = await gather_context(session, principal, question)
 
@@ -300,7 +298,7 @@ async def stream_answer(
     if hit is not None:
         yield "delta", hit.answer
         yield "done", {
-            "citations": [c.__dict__ for c in hit.citations],
+            "citations": [asdict(c) for c in hit.citations],
             "refused": hit.refused,
             "cached": True,
             "latency_ms": hit.latency_ms,
@@ -352,7 +350,7 @@ async def stream_answer(
         return
 
     yield "done", {
-        "citations": [c.__dict__ for c in result.citations],
+        "citations": [asdict(c) for c in result.citations],
         "refused": result.refused,
         "cached": False,
         "latency_ms": result.latency_ms,

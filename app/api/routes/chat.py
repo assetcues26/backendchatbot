@@ -8,7 +8,9 @@ asking.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
+from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -31,6 +33,8 @@ from app.core.security import current_principal, require_admin
 from app.db.models import AccessRequest, Role, Tenant, User
 from app.db.session import get_session
 from app.rag import answer as answer_service
+
+logger = logging.getLogger("assetcues.chat")
 
 router = APIRouter(tags=["chat"])
 
@@ -70,7 +74,7 @@ async def ask(
     )
     return AnswerOut(
         answer=result.answer,
-        citations=[CitationOut(**c.__dict__) for c in result.citations],
+        citations=[CitationOut(**asdict(c)) for c in result.citations],
         refused=result.refused,
         retracted=result.retracted,
         cached=result.cached,
@@ -94,7 +98,14 @@ async def ask_stream(
             ):
                 yield f"event: {name}\ndata: {json.dumps(data, default=str)}\n\n"
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an event
-            payload_out = {"message": "The assistant failed to answer.", "detail": str(exc)}
+            # Log it. An error event with no server-side trace is how a
+            # streaming bug stays invisible: the client shows one sentence,
+            # the access log shows a clean 200, and nothing says what broke.
+            logger.exception("streaming answer failed", exc_info=exc)
+            payload_out = {
+                "message": "The assistant failed to answer.",
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
             yield f"event: error\ndata: {json.dumps(payload_out)}\n\n"
 
     return StreamingResponse(
@@ -183,7 +194,7 @@ async def compare_roles(
             text, refused, citations = (
                 result.answer,
                 result.refused,
-                [CitationOut(**c.__dict__) for c in result.citations],
+                [CitationOut(**asdict(c)) for c in result.citations],
             )
         else:
             from app.rag.prompts import REFUSAL_TEXT

@@ -1,8 +1,10 @@
 """JWT verification and Principal construction (guardrail G2).
 
-Supabase signs access tokens with the project's JWT secret (HS256). We verify
-the signature, expiry and audience ourselves; we never trust unverified claims
-and we never read identity from anywhere but this module.
+Supabase signs access tokens either with an asymmetric project key
+(ES256/RS256, published at the project's JWKS endpoint) or, on older projects,
+with the shared HS256 secret. Both are verified here; the token's own header
+decides which. We never trust unverified claims and we never read identity
+from anywhere but this module.
 
 The token gives us a user id. Everything that matters for access control --
 tenant, roles, clearance, active status -- is then read from *our* database,
@@ -13,8 +15,12 @@ That property is what makes the "revoke mid-conversation" red-team test pass.
 
 from __future__ import annotations
 
+import logging
+import time
 import uuid
+from typing import Any
 
+import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
@@ -25,6 +31,8 @@ from app.config import Settings, get_settings
 from app.core.principal import Principal
 from app.db.models import Role, Tenant, User, UserRole
 from app.db.session import get_session
+
+logger = logging.getLogger("assetcues.security")
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -38,23 +46,90 @@ _INACTIVE = HTTPException(
 )
 
 
-def decode_token(token: str, settings: Settings) -> dict[str, object]:
-    """Verify signature, expiry and audience. Raises 401 on any failure."""
-    if not settings.supabase_jwt_secret:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="SUPABASE_JWT_SECRET is not configured",
-        )
+# Supabase projects created since the 2025 signing-key change issue tokens
+# signed with an asymmetric key (ES256/RS256) published at the project's JWKS
+# endpoint. Older projects sign with the shared HS256 secret. Both are
+# supported: the token's own header decides which path is used.
+_JWKS_TTL_SECONDS = 600
+_jwks_cache: list[dict[str, Any]] = []
+_jwks_fetched_at = 0.0
+
+
+async def _get_jwks(settings: Settings, *, force: bool = False) -> list[dict[str, Any]]:
+    """Fetch and cache the project's public signing keys."""
+    global _jwks_cache, _jwks_fetched_at
+
+    fresh = time.time() - _jwks_fetched_at < _JWKS_TTL_SECONDS
+    if _jwks_cache and fresh and not force:
+        return _jwks_cache
+
+    if not settings.supabase_url:
+        return []
+
+    url = f"{settings.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
     try:
-        return jwt.decode(
-            token,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
-            audience="authenticated",
-            options={"require_exp": True, "require_sub": True},
-        )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+            keys: list[dict[str, Any]] = list(payload.get("keys", []))
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("could not fetch JWKS from %s: %s", url, exc)
+        return _jwks_cache  # stale keys beat no keys
+
+    _jwks_cache = keys
+    _jwks_fetched_at = time.time()
+    return keys
+
+
+async def decode_token(token: str, settings: Settings) -> dict[str, Any]:
+    """Verify signature, expiry and audience. Raises 401 on any failure."""
+    try:
+        header = jwt.get_unverified_header(token)
     except JWTError as exc:
         raise _UNAUTHENTICATED from exc
+
+    algorithm = header.get("alg", "")
+    options = {"require_exp": True, "require_sub": True}
+
+    if algorithm.startswith("HS"):
+        if not settings.supabase_jwt_secret:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="SUPABASE_JWT_SECRET is not configured",
+            )
+        try:
+            return jwt.decode(
+                token,
+                settings.supabase_jwt_secret,
+                algorithms=["HS256"],
+                audience="authenticated",
+                options=options,
+            )
+        except JWTError as exc:
+            raise _UNAUTHENTICATED from exc
+
+    # Asymmetric. Find the key this token names; if we do not have it, the
+    # project may have rotated, so refetch once before giving up.
+    kid = header.get("kid")
+    for force in (False, True):
+        keys = await _get_jwks(settings, force=force)
+        key = next((k for k in keys if k.get("kid") == kid), None)
+        if key is None:
+            continue
+        try:
+            return jwt.decode(
+                token,
+                key,
+                algorithms=[algorithm],
+                audience="authenticated",
+                options=options,
+            )
+        except JWTError as exc:
+            raise _UNAUTHENTICATED from exc
+
+    logger.warning("no JWKS key matches kid=%s (alg=%s)", kid, algorithm)
+    raise _UNAUTHENTICATED
 
 
 async def load_principal(user_id: uuid.UUID, session: AsyncSession) -> Principal:
@@ -108,7 +183,7 @@ async def current_principal(
     if credentials is None or not credentials.credentials:
         raise _UNAUTHENTICATED
 
-    claims = decode_token(credentials.credentials, settings)
+    claims = await decode_token(credentials.credentials, settings)
     raw_sub = claims.get("sub")
     try:
         user_id = uuid.UUID(str(raw_sub))
