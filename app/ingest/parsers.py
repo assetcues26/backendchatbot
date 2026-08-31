@@ -312,6 +312,26 @@ def _clean_filename_title(path: Path) -> str:
     return stem[:500]
 
 
+def disambiguate_title(title: str, doc_type: str) -> str:
+    """Append the document type when the title alone does not identify it.
+
+    The AssetCues pack convention gives all three documents in a module the
+    same H1 -- "License Management" is both the customer User Manual and the
+    RESTRICTED Business Requirements Document. An administrator picking which
+    roles may read "License Management" from a list of two identical names is
+    one mis-click away from publishing the commercial model, so the stored
+    title has to carry the distinction.
+    """
+    if not doc_type or doc_type == "Document":
+        return title
+    # Already distinguishable: the title mentions what kind of document it is.
+    significant = [w for w in re.split(r"[^A-Za-z]+", doc_type) if len(w) > 3]
+    lowered = title.lower()
+    if any(word.lower() in lowered for word in significant):
+        return title
+    return f"{title} - {doc_type}"[:500]
+
+
 def _derive_title(lines: list[str], path: Path) -> str:
     """Prefer the document's own H1, but only if it names the document.
 

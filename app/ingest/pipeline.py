@@ -210,14 +210,26 @@ def _parse_bytes(data: bytes, suffix: str, filename: str) -> ParsedDocument:
 
     # The temp file's random name is useless for titling; recover from the
     # real filename when the document had no usable heading of its own.
-    if not parsed.title or staged.stem in parsed.title:
-        from app.ingest.parsers import _clean_filename_title
+    # Compare normalised forms: _clean_filename_title turns "tmpy_11rlhp" into
+    # "tmpy 11rlhp", so a raw `staged.stem in parsed.title` check missed it and
+    # a temp filename reached the database as a document title.
+    from app.ingest.parsers import _clean_filename_title
 
+    def _norm(value: str) -> str:
+        return "".join(ch for ch in value.lower() if ch.isalnum())
+
+    if not parsed.title or _norm(staged.stem) in _norm(parsed.title):
         parsed.title = _clean_filename_title(Path(filename))
     if not parsed.doc_type or parsed.doc_type == "Document":
         from app.ingest.parsers import _derive_doc_type
 
         parsed.doc_type = _derive_doc_type(filename, parsed.markdown)
+
+    # All three documents in a module often share one H1; make the stored
+    # title identify which is which before an admin grants access to it.
+    from app.ingest.parsers import disambiguate_title
+
+    parsed.title = disambiguate_title(parsed.title, parsed.doc_type)
     return parsed
 
 
@@ -248,7 +260,11 @@ async def _create(
         source_filename=filename,
         source_key=source_key,
         module=module,
-        doc_type=suggested.doc_type if suggested else parsed.doc_type,
+        # The parser's doc_type comes from the filename and was correct on
+        # all 21 real documents. The classifier's free-text label ('QA Test
+        # Cases Workbook') looks similar but breaks the deterministic
+        # DOC_TYPE_ACCESS lookup, so the canonical value wins.
+        doc_type=parsed.doc_type,
         content_sha256=content_hash,
         version=1,
         byte_size=byte_size,
@@ -345,7 +361,7 @@ async def _replace(
         document.suggested_role_keys = suggested.role_keys
         document.suggested_sensitivity = suggested.sensitivity
         document.classifier_rationale = suggested.rationale
-        document.doc_type = suggested.doc_type
+        document.doc_type = parsed.doc_type  # canonical, not the classifier's label
 
     await session.flush()
     embedded = await _write_chunks(session, document, chunks, reuse=reuse)
