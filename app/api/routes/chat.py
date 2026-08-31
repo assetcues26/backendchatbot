@@ -70,11 +70,12 @@ async def ask(
 ) -> AnswerOut:
     await enforce_rate_limit(principal)
     result = await answer_service.answer_question(
-        session, principal, payload.question
+        session, principal, payload.question, payload.history
     )
     return AnswerOut(
         answer=result.answer,
         citations=[CitationOut(**asdict(c)) for c in result.citations],
+        follow_ups=result.follow_ups,
         refused=result.refused,
         retracted=result.retracted,
         cached=result.cached,
@@ -94,7 +95,7 @@ async def ask_stream(
     async def events() -> AsyncIterator[str]:
         try:
             async for name, data in answer_service.stream_answer(
-                session, principal, payload.question
+                session, principal, payload.question, payload.history
             ):
                 yield f"event: {name}\ndata: {json.dumps(data, default=str)}\n\n"
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an event

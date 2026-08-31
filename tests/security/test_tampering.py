@@ -73,8 +73,21 @@ def test_no_request_model_lets_caller_assert_identity(model: type[BaseModel]) ->
     )
 
 
-def test_ask_request_carries_only_a_question() -> None:
-    assert set(schemas.AskRequest.model_fields) == {"question"}
+def test_ask_request_carries_only_a_question_and_prior_questions() -> None:
+    """Pin the chat request surface so a new field needs a deliberate change.
+
+    `history` was added for follow-ups and holds the caller's own earlier
+    QUESTIONS. It must never grow a slot for assistant answers: a client can
+    put anything in a request body, and fabricated "the assistant said X"
+    text would be attacker-controlled input going straight into the prompt.
+    """
+    assert set(schemas.AskRequest.model_fields) == {"question", "history"}
+
+    history = schemas.AskRequest.model_fields["history"]
+    assert history.annotation == list[str], (
+        "history must be a flat list of question strings; a structured turn "
+        "type would let an assistant answer be smuggled in"
+    )
 
 
 def _routes_of(module: object) -> list:

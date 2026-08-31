@@ -19,6 +19,8 @@ claim remains, and the answer is withheld only when nothing can be traced.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass, field, replace
@@ -47,6 +49,7 @@ class Citation:
 class AnswerResult:
     answer: str
     citations: list[Citation] = field(default_factory=list)
+    follow_ups: list[str] = field(default_factory=list)
     refused: bool = False
     retracted: bool = False
     latency_ms: int = 0
@@ -126,9 +129,102 @@ def build_citations(chunks: list[RetrievedChunk], cited: set[str]) -> list[Citat
     ]
 
 
+# How many earlier questions a follow-up may see. Five is enough to resolve
+# "what about for sales?" without letting the prompt grow unbounded.
+MAX_HISTORY = 5
+
+# Only the user's own earlier QUESTIONS are accepted as conversation memory --
+# never assistant answers. A client could fabricate an "assistant said X" turn,
+# and anything we put in the prompt from that is attacker-controlled text. The
+# user's own questions add no capability they did not already have, and are
+# enough to resolve a reference.
+# Word boundaries are load-bearing: without them "Entitlement" contains
+# "it", every question looks like a follow-up, and the gate saves nothing.
+_FOLLOWUP_HINT = re.compile(
+    r"^\s*(and|also|what about|how about|why|so|then|ok|okay)\b"
+    r"|\b(it|that|those|these|them|this|the same|there)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_a_follow_up(question: str) -> bool:
+    """Cheap gate before spending a model call on rewriting.
+
+    A long, self-contained question does not need condensing, and most do not.
+    Skipping those keeps the common path to one model call.
+    """
+    return len(question) < 90 or bool(_FOLLOWUP_HINT.search(question))
+
+
+async def condense_question(question: str, history: list[str]) -> str:
+    """Rewrite a follow-up so retrieval sees a standalone question.
+
+    Retrieval matches on the question text, so "what about for sales?" would
+    otherwise retrieve nothing useful. Failure is non-fatal: we fall back to
+    the original wording rather than lose the turn.
+    """
+    trimmed = [q.strip()[:500] for q in history if q and q.strip()][-MAX_HISTORY:]
+    if not trimmed or not looks_like_a_follow_up(question):
+        return question
+
+    try:
+        rewritten = await llm.complete(
+            prompts.CONDENSE_SYSTEM_PROMPT,
+            prompts.build_condense_prompt(question, trimmed),
+            max_tokens=120,
+        )
+    except Exception:  # noqa: BLE001 - a rewrite is an optimisation, not a step
+        return question
+
+    rewritten = rewritten.strip().strip('"')
+    # Guard against a model that decides to answer instead of rewrite.
+    if not rewritten or len(rewritten) > 400:
+        return question
+    return rewritten
+
+
+async def suggest_follow_ups(
+    question: str, answer: str, chunks: list[RetrievedChunk]
+) -> list[str]:
+    """Propose next questions, grounded in what this caller could actually read.
+
+    Generated from the chunks already retrieved for them, so a suggestion can
+    never point at a document they would then be refused.
+    """
+    if not chunks or not answer.strip():
+        return []
+
+    headings = list(
+        dict.fromkeys(
+            f"{c.title} - {c.heading_path}" if c.heading_path else c.title
+            for c in chunks
+        )
+    )[:8]
+
+    try:
+        raw = await llm.complete_json(
+            prompts.FOLLOWUP_SYSTEM_PROMPT,
+            prompts.build_followup_prompt(question, answer, headings),
+            prompts.FOLLOWUP_SCHEMA,
+            "follow_up_questions",
+            max_tokens=200,
+        )
+        parsed = json.loads(raw).get("questions", [])
+    except Exception:  # noqa: BLE001 - suggestions are a nicety, never a blocker
+        return []
+
+    out: list[str] = []
+    for item in parsed:
+        text = str(item).strip()
+        if text and text.lower() != question.strip().lower() and len(text) < 160:
+            out.append(text)
+    return out[:3]
+
+
 async def gather_context(
     session: AsyncSession, principal: Principal, question: str
 ) -> tuple[RetrievalResult, list[float]]:
+    """Embed and retrieve. `question` must already be standalone."""
     settings = get_settings()
     vector = await llm.embed_query(question)
     result = await retrieve(
@@ -150,6 +246,7 @@ async def _finalise(
     raw_answer: str,
     context: RetrievalResult,
     started: float,
+    follow_ups: list[str] | None = None,
 ) -> AnswerResult:
     """Post-generation checks and the audit write. Shared by both paths."""
     check = guardrails.validate_citations(
@@ -241,6 +338,7 @@ async def _finalise(
             if retracted or is_refusal
             else build_citations(context.chunks, check.valid)
         ),
+        follow_ups=follow_ups or [],
         refused=is_refusal,
         retracted=retracted,
         latency_ms=latency,
@@ -253,67 +351,90 @@ async def _finalise(
 
 
 async def answer_question(
-    session: AsyncSession, principal: Principal, question: str
+    session: AsyncSession,
+    principal: Principal,
+    question: str,
+    history: list[str] | None = None,
 ) -> AnswerResult:
     """Non-streaming answer. Used by the role-comparison view and tests."""
     started = time.time()
     version = await audit.get_acl_version(session)
-    key = cache_key(question, principal, version)
+
+    # Resolve references against the caller's own earlier questions before
+    # anything touches retrieval. The cache is keyed on the resolved text, so
+    # two people asking the same follow-up from different threads do not
+    # collide.
+    resolved = await condense_question(question, history or [])
+    key = cache_key(resolved, principal, version)
 
     hit = cache_get(key)
     if hit is not None:
         return replace(hit, cached=True)
 
-    context, _ = await gather_context(session, principal, question)
+    context, _ = await gather_context(session, principal, resolved)
 
     if not context.chunks:
         result = await _finalise(
-            session, principal, question, prompts.REFUSAL_TEXT, context, started
+            session, principal, resolved, prompts.REFUSAL_TEXT, context, started
         )
         cache_put(key, result)
         return result
 
     raw = await llm.complete(
         prompts.build_system_prompt(principal),
-        prompts.build_user_prompt(question, context.chunks),
+        prompts.build_user_prompt(resolved, context.chunks),
         max_tokens=1200,
     )
-    result = await _finalise(session, principal, question, raw, context, started)
+    suggestions = await suggest_follow_ups(resolved, raw, context.chunks)
+    result = await _finalise(
+        session, principal, resolved, raw, context, started, suggestions
+    )
     cache_put(key, result)
     return result
 
 
 async def stream_answer(
-    session: AsyncSession, principal: Principal, question: str
+    session: AsyncSession,
+    principal: Principal,
+    question: str,
+    history: list[str] | None = None,
 ) -> AsyncIterator[tuple[str, object]]:
     """Yield (event_name, payload) pairs for the SSE endpoint.
 
-    Events: `sources`, `delta`, `done`, `retracted`.
+    Events: `sources`, `delta`, `done`, `retracted`, `follow_ups`.
     """
     started = time.time()
     version = await audit.get_acl_version(session)
-    key = cache_key(question, principal, version)
+
+    resolved = await condense_question(question, history or [])
+    key = cache_key(resolved, principal, version)
 
     hit = cache_get(key)
     if hit is not None:
         yield "delta", hit.answer
         yield "done", {
             "citations": [asdict(c) for c in hit.citations],
+            "follow_ups": hit.follow_ups,
             "refused": hit.refused,
             "cached": True,
             "latency_ms": hit.latency_ms,
         }
         return
 
-    context, _ = await gather_context(session, principal, question)
+    context, _ = await gather_context(session, principal, resolved)
 
     if not context.chunks:
         result = await _finalise(
-            session, principal, question, prompts.REFUSAL_TEXT, context, started
+            session, principal, resolved, prompts.REFUSAL_TEXT, context, started
         )
         cache_put(key, result)
         yield "delta", result.answer
-        yield "done", {"citations": [], "refused": True, "cached": False}
+        yield "done", {
+            "citations": [],
+            "follow_ups": [],
+            "refused": True,
+            "cached": False,
+        }
         return
 
     # Announce which sources are in play before the text arrives, so the UI can
@@ -331,14 +452,18 @@ async def stream_answer(
     parts: list[str] = []
     async for delta in llm.stream_completion(
         prompts.build_system_prompt(principal),
-        prompts.build_user_prompt(question, context.chunks),
+        prompts.build_user_prompt(resolved, context.chunks),
         max_tokens=1200,
     ):
         parts.append(delta)
         yield "delta", delta
 
+    raw = "".join(parts)
+    # Suggestions are generated after the text has streamed, so the reader is
+    # never kept waiting on them.
+    suggestions = await suggest_follow_ups(resolved, raw, context.chunks)
     result = await _finalise(
-        session, principal, question, "".join(parts), context, started
+        session, principal, resolved, raw, context, started, suggestions
     )
     cache_put(key, result)
 
@@ -351,6 +476,7 @@ async def stream_answer(
 
     yield "done", {
         "citations": [asdict(c) for c in result.citations],
+        "follow_ups": result.follow_ups,
         "refused": result.refused,
         "cached": False,
         "latency_ms": result.latency_ms,

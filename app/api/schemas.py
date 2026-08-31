@@ -35,7 +35,17 @@ class Health(BaseModel):
 
 
 class AskRequest(BaseModel):
+    """A question, plus the caller's own earlier questions for context.
+
+    `history` holds previous USER questions only -- never assistant
+    answers. A client can fabricate anything it sends, and fabricated
+    "the assistant said X" text would go straight into the prompt. The
+    user's own questions grant no capability they did not already have,
+    and are enough to resolve "what about for sales?".
+    """
+
     question: str = Field(min_length=1, max_length=2000)
+    history: list[str] = Field(default_factory=list, max_length=5)
 
 
 class CitationOut(BaseModel):
@@ -51,6 +61,7 @@ class CitationOut(BaseModel):
 class AnswerOut(BaseModel):
     answer: str
     citations: list[CitationOut] = []
+    follow_ups: list[str] = []
     refused: bool = False
     retracted: bool = False
     cached: bool = False

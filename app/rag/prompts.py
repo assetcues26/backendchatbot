@@ -210,3 +210,77 @@ CLASSIFICATION_SCHEMA = {
     "required": ["sensitivity", "role_keys", "doc_type", "rationale"],
     "additionalProperties": False,
 }
+
+
+# ---------------------------------------------------------------------------
+# Follow-up conversation
+# ---------------------------------------------------------------------------
+
+CONDENSE_SYSTEM_PROMPT = """\
+You rewrite a follow-up question so it can be understood on its own.
+
+You are given the last few questions a person asked, then their newest one. \
+Rewrite ONLY the newest question so that it still means the same thing \
+without the earlier ones for context.
+
+Rules:
+- Replace pronouns and references ("it", "that", "those", "the same") with \
+what they refer to.
+- Keep the person's own wording and terminology wherever you can.
+- Do not answer the question. Do not add facts. Do not invent detail that was \
+not in the conversation.
+- If the newest question already stands alone, return it unchanged.
+- Return the rewritten question and nothing else.\
+"""
+
+FOLLOWUP_SYSTEM_PROMPT = """\
+You propose what someone might sensibly ask next.
+
+You are given a question, the answer they received, and the section headings \
+of the source material that answer was drawn from. Propose up to three short \
+follow-up questions.
+
+Rules:
+- Every question must be answerable from the SAME material the headings \
+describe. Never propose a question that would need a document not listed.
+- Make them specific to this product and this answer. "Tell me more" is \
+useless; "Which roles can edit a standard Permission Group?" is useful.
+- Keep each under twelve words.
+- Do not repeat the question that was just asked.
+- If nothing sensible follows, return an empty list.\
+"""
+
+FOLLOWUP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Up to three short follow-up questions.",
+        }
+    },
+    "required": ["questions"],
+    "additionalProperties": False,
+}
+
+
+def build_condense_prompt(question: str, history: list[str]) -> str:
+    previous = "\n".join(f"- {q}" for q in history)
+    return (
+        f"EARLIER QUESTIONS (oldest first)\n{previous}\n\n"
+        f"NEWEST QUESTION\n{question}\n\n"
+        f"Rewrite the newest question so it stands alone."
+    )
+
+
+def build_followup_prompt(
+    question: str, answer: str, headings: list[str]
+) -> str:
+    sources = "\n".join(f"- {h}" for h in headings) or "(none)"
+    return (
+        f"QUESTION\n{question}\n\n"
+        f"ANSWER\n{answer[:1500]}\n\n"
+        f"SECTIONS THIS CAME FROM\n{sources}\n\n"
+        f"Propose up to three follow-up questions answerable from those "
+        f"same sections."
+    )
