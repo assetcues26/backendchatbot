@@ -32,8 +32,6 @@ services:
         sync: false
       - key: SUPABASE_JWT_SECRET
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
       # Your Vercel URL. Comma-separated if you add preview domains.
       - key: CORS_ORIGINS
         sync: false

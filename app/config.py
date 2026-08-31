@@ -29,11 +29,12 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(default=1536, alias="EMBEDDING_DIM")
 
     # --- Supabase Auth
+    # Deliberately NO service-role key. It bypasses Row Level Security and
+    # nothing here needs it: the database is reached over DATABASE_URL and
+    # tokens are verified locally against the JWT secret. Do not add it
+    # back without a caller that genuinely requires it.
     supabase_url: str = Field(default="", alias="SUPABASE_URL")
     supabase_jwt_secret: str = Field(default="", alias="SUPABASE_JWT_SECRET")
-    supabase_service_role_key: str = Field(
-        default="", alias="SUPABASE_SERVICE_ROLE_KEY"
-    )
 
     # --- App
     environment: Literal["development", "staging", "production"] = Field(
