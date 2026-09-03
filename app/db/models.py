@@ -201,6 +201,25 @@ class Document(Base):
 
     # Scraped verbatim from the document's own "Primary audience" field.
     declared_audience: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
+
+    # The taxonomy these files declare in their own header table. Capability is
+    # what routing filters on: it is the finest level, it distinguishes
+    # documents whose boilerplate is otherwise identical, and it is written in
+    # the document rather than invented here.
+    capability: Mapped[str] = mapped_column(String(200), default="", index=True)
+    module_declared: Mapped[str] = mapped_column(String(200), default="")
+    product_domain: Mapped[str] = mapped_column(String(200), default="")
+
+    # Produced by the document pass in app/ingest/enrich.py. `summary` and
+    # `key_terms` feed chunk contextualisation; `distinguishing_points` is what
+    # lets an answer say how two capabilities differ instead of silently
+    # choosing one.
+    summary: Mapped[str] = mapped_column(Text, default="")
+    key_terms: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
+    distinguishing_points: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), default=list
+    )
+    enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Classifier proposal, held for the admin to accept or override.
     suggested_role_keys: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
     suggested_sensitivity: Mapped[int | None] = mapped_column(SmallInteger)
@@ -320,6 +339,13 @@ class Chunk(Base):
     ordinal: Mapped[int] = mapped_column(Integer)
     heading_path: Mapped[str] = mapped_column(Text, default="")
     text: Mapped[str] = mapped_column(Text)
+
+    # A short passage situating this chunk inside its own document, written at
+    # ingest. Embedded together with the text so retrieval can tell apart rows
+    # that are byte-identical across capabilities -- but NEVER shown and NEVER
+    # citable, so no generated sentence can reach a reader as if the document
+    # had said it. See app/ingest/enrich.py.
+    context: Mapped[str] = mapped_column(Text, default="")
     text_sha256: Mapped[str] = mapped_column(String(64), index=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
 

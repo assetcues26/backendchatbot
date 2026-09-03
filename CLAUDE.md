@@ -12,12 +12,13 @@ the SQL retrieval query, not in the prompt.**
 .venv/Scripts/python.exe -m alembic upgrade head  # migrate
 .venv/Scripts/python.exe -m uvicorn app.main:app --reload
 acues-ingest sync "<folder>" [--auto-approve|--dry-run]
+acues-ingest enrich [--all] [--force]   # re-read documents already ingested
 acues-ingest status
 ```
 
 Before saying work is done: `ruff check .` && `mypy app` && `pytest -q` all clean.
 
-## The five rules
+## The seven rules
 
 1. **Identity comes from the JWT, never from a request.** Only
    `app/core/security.py:current_principal` may produce a `Principal`. Adding
@@ -34,6 +35,13 @@ Before saying work is done: `ruff check .` && `mypy app` && `pytest -q` all clea
    it lets a revoked user keep reading.
 5. **Never widen the refusal message.** One wording for every refusal.
    Confirming that restricted material exists is itself a disclosure.
+6. **Generated context is embedded, never shown.** `chunks.context` is written
+   by a model at ingest. `RetrievedChunk` has no field for it and the search
+   query never selects it, so no generated sentence can be quoted as though a
+   document said it. Adding it to either fails `tests/test_enrichment.py`.
+7. **A capability scope may only narrow.** It arrives in the request body, so
+   `SCOPED_DOCS_CTE` selects FROM `visible_docs` and can only return a subset.
+   Never `OR` it into the access predicate.
 
 ## Layout
 
@@ -43,6 +51,10 @@ Before saying work is done: `ruff check .` && `mypy app` && `pytest -q` all clea
 | `app/rag/answer.py` | Orchestration: retrieve, generate, verify, audit. Answer cache (G7). |
 | `app/rag/guardrails.py` | Citation validation (G6), injection detection. |
 | `app/rag/prompts.py` | Prompt assembly, document fencing (G5), refusal text. |
+| `app/rag/routing.py` | Which capability a question is about, and when to ask instead. |
+| `app/rag/ingest_prompts.py` | Prompts whose output is embedded but never shown. |
+| `app/ingest/enrich.py` | Document profiling and per-chunk contextualisation. |
+| `app/ingest/backfill.py` | Re-enriching documents already in the database. |
 | `app/core/principal.py` | The `Principal` type. Identity rules. |
 | `app/core/security.py` | JWT verification, `current_principal`, `require_admin`. |
 | `app/db/models.py` | Schema. Cascade rules are documented in the module docstring. |
@@ -69,10 +81,20 @@ Read these on demand rather than loading them up front:
 - `docs/DATA_MODEL.md` — schema and the retrieval predicate in full
 - `docs/INGESTION.md` — hashing, re-embedding, deletion, re-approval rules
 - `docs/RUNBOOK.md` — deploy, key rotation, incident response, known limits
-- `docs/decisions/` — why pgvector over a vector DB, why no LangChain, why hybrid search
+- `docs/decisions/` — why pgvector over a vector DB, why no LangChain, why
+  hybrid search, why chunks are enriched at ingest (ADR-0004)
 
 ## Environment
 
 Copy `.env.example` to `.env`. `OPENAI_API_KEY` is the only vendor credential;
 it is read from the environment and never committed, logged, or sent to the
 browser.
+
+`TEST_DATABASE_URL` is a **separate, scratch** database for `tests/security`.
+That suite drops every table it finds, and it refuses to run when
+`TEST_DATABASE_URL` equals `DATABASE_URL`. Do not point it at the working
+database to "just run the tests" -- that deletes the corpus, and an opt-in
+flag will not save you, because the flag confirms the suite is destructive and
+says nothing about which database is configured.
+
+    TEST_DATABASE_URL=... ALLOW_DESTRUCTIVE_TESTS=1 pytest tests/security

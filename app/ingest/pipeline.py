@@ -28,11 +28,13 @@ import asyncio
 import hashlib
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core import audit
 from app.core.principal import Principal
 from app.db.models import (
@@ -49,6 +51,13 @@ from app.db.models import (
 from app.ingest.chunker import Chunk as TextChunk
 from app.ingest.chunker import chunk_markdown
 from app.ingest.classifier import Classification, classify
+from app.ingest.enrich import (
+    DocumentProfile,
+    chunk_digest,
+    chunk_key,
+    embedding_text,
+    enrich_document,
+)
 from app.ingest.parsers import ParsedDocument, parse_document
 from app.rag import llm
 
@@ -68,6 +77,8 @@ class IngestResult:
     chunks_reused: int
     requires_reapproval: bool
     message: str = ""
+    capability: str = ""
+    chunks_contextualised: int = 0
 
     @property
     def embedding_saved(self) -> int:
@@ -97,6 +108,7 @@ async def ingest_bytes(
     module: str = "",
     principal: Principal | None = None,
     run_classifier: bool = True,
+    enrich_content: bool = True,
     suggested: Classification | None = None,
 ) -> IngestResult:
     """Ingest or re-ingest one document. Idempotent on content.
@@ -138,6 +150,25 @@ async def ingest_bytes(
     if suggested is None and run_classifier:
         suggested = await classify(parsed, filename, module)
 
+    # Enrichment happens here, before a single row is written. It is the
+    # slowest part of an ingest -- a hundred model calls for a large workbook
+    # -- and doing it inside the write transaction would hold locks on the
+    # documents table for minutes at a time.
+    prior_contexts, prior_vectors = (
+        await _prior_chunk_state(session, existing.id)
+        if existing is not None
+        else ({}, {})
+    )
+    profile, contexts = await enrich_document(
+        parsed,
+        filename=filename,
+        module=module,
+        chunks=chunks,
+        siblings=await sibling_capabilities(session, tenant_id),
+        reuse_contexts=prior_contexts,
+        use_llm=enrich_content and get_settings().enrichment_enabled,
+    )
+
     if existing is None:
         return await _create(
             session,
@@ -147,6 +178,8 @@ async def ingest_bytes(
             module=module,
             parsed=parsed,
             chunks=chunks,
+            contexts=contexts,
+            profile=profile,
             content_hash=content_hash,
             byte_size=len(data),
             suggested=suggested,
@@ -159,6 +192,9 @@ async def ingest_bytes(
         filename=filename,
         parsed=parsed,
         chunks=chunks,
+        contexts=contexts,
+        profile=profile,
+        reuse=prior_vectors,
         content_hash=content_hash,
         byte_size=len(data),
         suggested=suggested,
@@ -175,6 +211,7 @@ async def ingest_path(
     module: str | None = None,
     principal: Principal | None = None,
     run_classifier: bool = True,
+    enrich_content: bool = True,
     suggested: Classification | None = None,
 ) -> IngestResult:
     # Reading and parsing a 30k-word workbook takes long enough to stall the
@@ -189,6 +226,7 @@ async def ingest_path(
         module=module if module is not None else path.parent.name,
         principal=principal,
         run_classifier=run_classifier,
+        enrich_content=enrich_content,
         suggested=suggested,
     )
 
@@ -242,6 +280,8 @@ async def _create(
     module: str,
     parsed: ParsedDocument,
     chunks: list[TextChunk],
+    contexts: list[str],
+    profile: DocumentProfile,
     content_hash: str,
     byte_size: int,
     suggested: Classification | None,
@@ -277,10 +317,13 @@ async def _create(
         classifier_rationale=suggested.rationale if suggested else "",
         uploaded_by=principal.user_id if principal else None,
     )
+    apply_profile(document, profile)
     session.add(document)
     await session.flush()
 
-    embedded = await _write_chunks(session, document, chunks, reuse={})
+    embedded = await _write_chunks(
+        session, document, chunks, contexts=contexts, reuse={}
+    )
 
     document.status = DocStatus.PENDING_REVIEW
     session.add(
@@ -318,6 +361,8 @@ async def _create(
         chunks_reused=0,
         requires_reapproval=True,
         message="Awaiting administrator approval before it can be read.",
+        capability=document.capability,
+        chunks_contextualised=sum(1 for c in contexts if c),
     )
 
 
@@ -328,6 +373,9 @@ async def _replace(
     filename: str,
     parsed: ParsedDocument,
     chunks: list[TextChunk],
+    contexts: list[str],
+    profile: DocumentProfile,
+    reuse: dict[str, list[float]],
     content_hash: str,
     byte_size: int,
     suggested: Classification | None,
@@ -336,18 +384,6 @@ async def _replace(
     """Update in place, re-embedding only the chunks whose text changed."""
     previous_status = document.status
     previous_sensitivity = document.sensitivity
-
-    # Existing chunk text -> embedding, so unchanged text keeps its vector.
-    reuse: dict[str, list[float]] = {}
-    for row in (
-        await session.execute(
-            select(Chunk.text_sha256, Chunk.embedding).where(
-                Chunk.document_id == document.id
-            )
-        )
-    ).all():
-        if row[1] is not None:
-            reuse[row[0]] = list(row[1])
 
     await session.execute(delete(Chunk).where(Chunk.document_id == document.id))
 
@@ -362,9 +398,12 @@ async def _replace(
         document.suggested_sensitivity = suggested.sensitivity
         document.classifier_rationale = suggested.rationale
         document.doc_type = parsed.doc_type  # canonical, not the classifier's label
+    apply_profile(document, profile)
 
     await session.flush()
-    embedded = await _write_chunks(session, document, chunks, reuse=reuse)
+    embedded = await _write_chunks(
+        session, document, chunks, contexts=contexts, reuse=reuse
+    )
     reused = len(chunks) - embedded
 
     # The safety rule for edits: if the new content classifies as MORE
@@ -448,6 +487,8 @@ async def _replace(
             if requires_reapproval
             else "Updated in place; existing access retained."
         ),
+        capability=document.capability,
+        chunks_contextualised=sum(1 for c in contexts if c),
     )
 
 
@@ -456,25 +497,37 @@ async def _write_chunks(
     document: Document,
     chunks: list[TextChunk],
     *,
+    contexts: list[str],
     reuse: dict[str, list[float]],
 ) -> int:
-    """Persist chunks, embedding only those whose text we have not seen.
+    """Persist chunks, embedding only those we have not embedded before.
+
+    What gets embedded is the context, the heading path and the text together.
+    What gets stored as `text` -- and so what can ever be quoted or cited -- is
+    the document's own words alone. The full-text index is likewise computed
+    from `text` only, so a keyword search still matches real words in the file.
 
     Returns the number of chunks that needed a fresh embedding call.
     """
-    hashes = [sha256_text(f"{c.heading_path}\n{c.text}") for c in chunks]
+    digests = [
+        chunk_digest(context, chunk.heading_path, chunk.text)
+        for context, chunk in zip(contexts, chunks, strict=True)
+    ]
     to_embed = [
-        index for index, digest in enumerate(hashes) if digest not in reuse
+        index for index, digest in enumerate(digests) if digest not in reuse
     ]
 
     vectors: dict[int, list[float]] = {}
     if to_embed:
-        texts = [_embedding_text(chunks[i]) for i in to_embed]
+        texts = [
+            embedding_text(contexts[i], chunks[i].heading_path, chunks[i].text)
+            for i in to_embed
+        ]
         computed = await llm.embed_texts(texts)
         vectors = dict(zip(to_embed, computed, strict=True))
 
     for index, chunk in enumerate(chunks):
-        digest = hashes[index]
+        digest = digests[index]
         session.add(
             Chunk(
                 document_id=document.id,
@@ -482,6 +535,7 @@ async def _write_chunks(
                 ordinal=chunk.ordinal,
                 heading_path=chunk.heading_path,
                 text=chunk.text,
+                context=contexts[index],
                 text_sha256=digest,
                 token_count=chunk.token_count,
                 embedding=vectors.get(index) or reuse.get(digest),
@@ -492,11 +546,86 @@ async def _write_chunks(
     return len(to_embed)
 
 
-def _embedding_text(chunk: object) -> str:
-    """Prepend the heading path so section names are themselves searchable."""
-    heading = getattr(chunk, "heading_path", "")
-    text = getattr(chunk, "text", "")
-    return f"{heading}\n\n{text}".strip() if heading else text
+def apply_profile(document: Document, profile: DocumentProfile) -> None:
+    """Record what the enrichment pass learned about the document.
+
+    `capability` is always set -- it falls back to the folder name, so routing
+    always has something to filter on. `enriched_at` is set only when a model
+    pass actually succeeded, which is what `acues-ingest enrich --missing`
+    looks for.
+    """
+    document.capability = profile.capability[:200]
+    document.module_declared = profile.module_declared[:200]
+    document.product_domain = profile.product_domain[:200]
+    document.summary = profile.summary
+    document.key_terms = profile.key_terms
+    document.distinguishing_points = profile.distinguishing_points
+    if not profile.is_empty and profile.summary:
+        document.enriched_at = datetime.now(UTC)
+
+
+async def sibling_capabilities(
+    session: AsyncSession, tenant_id: uuid.UUID
+) -> dict[str, str]:
+    """Capability per folder, learned from documents that declare one.
+
+    Only two of the three files in a folder tend to carry the header table, so
+    a QA workbook can inherit its capability from the specification sitting
+    beside it instead of paying for a model call to guess.
+
+    Rows where `capability` merely equals the folder name are ignored: that is
+    the seeded default, not a declaration, and it would otherwise shadow a real
+    one.
+    """
+    rows = (
+        await session.execute(
+            select(Document.module, Document.capability).where(
+                Document.tenant_id == tenant_id,
+                Document.capability != "",
+                Document.module != "",
+                Document.capability != Document.module,
+            )
+        )
+    ).all()
+
+    tally: dict[str, dict[str, int]] = {}
+    for module, capability in rows:
+        tally.setdefault(module, {})
+        tally[module][capability] = tally[module].get(capability, 0) + 1
+
+    return {
+        module: max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        for module, counts in tally.items()
+    }
+
+
+async def _prior_chunk_state(
+    session: AsyncSession, document_id: uuid.UUID
+) -> tuple[dict[str, str], dict[str, list[float]]]:
+    """What the previous version of a document already paid for.
+
+    Two maps, because they answer different questions:
+
+    * source text -> context, so unchanged sections keep their context free.
+    * stored digest -> embedding, so a chunk is only re-embedded when the text
+      or the context actually changed.
+    """
+    contexts: dict[str, str] = {}
+    vectors: dict[str, list[float]] = {}
+
+    for heading, text, context, embedding in (
+        await session.execute(
+            select(
+                Chunk.heading_path, Chunk.text, Chunk.context, Chunk.embedding
+            ).where(Chunk.document_id == document_id)
+        )
+    ).all():
+        if context:
+            contexts[chunk_key(heading, text)] = context
+        if embedding is not None:
+            vectors[chunk_digest(context, heading, text)] = list(embedding)
+
+    return contexts, vectors
 
 
 async def _count_chunks(session: AsyncSession, document_id: uuid.UUID) -> int:

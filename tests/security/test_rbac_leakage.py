@@ -555,3 +555,150 @@ async def test_a_nonexistent_tenant_returns_nothing(session, world) -> None:
     )
     for query in SEARCH.values():
         assert await search_as(session, ghost, query) == ""
+
+
+# ---------------------------------------------------------------------------
+# Capability scoping may only ever narrow
+# ---------------------------------------------------------------------------
+#
+# The capability arrives in the request body -- it is the chip a user clicked
+# on a clarifying question. Everything below asserts the one property that
+# makes that safe: it removes documents from a search, and can never add one.
+
+
+async def _label_capabilities(session, world: dict) -> None:
+    """Give the fixture documents distinct capabilities to route between."""
+    labels = {
+        "license_brd": "License Management",
+        "uam_spec": "User Access & Permission Management",
+        "uam_tests": "User Access & Permission Management",
+        "taxonomy_guide": "Asset Taxonomy & Catalogue",
+    }
+    docs = world["docs"]
+    for name, capability in labels.items():
+        await session.execute(
+            text("UPDATE documents SET capability = :c WHERE id = :i"),
+            {"c": capability, "i": str(docs[name].id)},
+        )
+    await session.flush()
+
+
+async def _search_scoped(session, principal, query: str, capability: str) -> str:
+    chunks = await hybrid_search(
+        session,
+        principal,
+        query,
+        fake_embedding(query),
+        top_k=12,
+        candidates=50,
+        rrf_k=60,
+        capability=capability,
+    )
+    return "\n".join(c.text for c in chunks)
+
+
+async def test_scoping_to_a_capability_you_cannot_read_returns_nothing(
+    session, world
+) -> None:
+    """The attack this filter must survive.
+
+    A customer names the capability holding the commercial licence model. The
+    result must be empty -- not the document, and not an error that confirms
+    the capability exists.
+    """
+    await _label_capabilities(session, world)
+    customer = await principal_for(session, world["users"]["customer"])
+
+    visible = await _search_scoped(
+        session, customer, SEARCH["envelope"], "License Management"
+    )
+    assert PARTNER_ENVELOPE not in visible
+    assert visible == ""
+
+
+@pytest.mark.parametrize("role", ["qa", "support", "customer", "noroles"])
+async def test_no_capability_name_grants_what_the_acl_denies(
+    session, world, role
+) -> None:
+    """Try every capability in turn; none of them opens the licence BRD."""
+    await _label_capabilities(session, world)
+    principal = await principal_for(session, world["users"][role])
+
+    for capability in [
+        "License Management",
+        "User Access & Permission Management",
+        "Asset Taxonomy & Catalogue",
+        "",
+    ]:
+        visible = await _search_scoped(
+            session, principal, SEARCH["envelope"], capability
+        )
+        assert PARTNER_ENVELOPE not in visible, (
+            f"{role} read the licence BRD by scoping to {capability!r}"
+        )
+
+
+async def test_a_scoped_search_is_a_subset_of_the_unscoped_one(
+    session, world
+) -> None:
+    """The narrowing property, stated directly against the database.
+
+    Whatever a scope does, the chunks it returns must be chunks the same
+    principal would have got without it.
+    """
+    await _label_capabilities(session, world)
+    sales = await principal_for(session, world["users"]["sales"])
+
+    unscoped = await hybrid_search(
+        session,
+        sales,
+        SEARCH["envelope"],
+        fake_embedding(SEARCH["envelope"]),
+        top_k=50,
+        candidates=50,
+        rrf_k=60,
+    )
+    scoped = await hybrid_search(
+        session,
+        sales,
+        SEARCH["envelope"],
+        fake_embedding(SEARCH["envelope"]),
+        top_k=50,
+        candidates=50,
+        rrf_k=60,
+        capability="License Management",
+    )
+
+    assert {c.chunk_id for c in scoped} <= {c.chunk_id for c in unscoped}
+    assert scoped, "sanity: sales can read this capability"
+
+
+async def test_a_scope_keeps_out_the_capability_that_was_not_chosen(
+    session, world
+) -> None:
+    """The point of the feature: one capability's answer, not another's."""
+    await _label_capabilities(session, world)
+    engineering = await principal_for(session, world["users"]["engineering"])
+
+    scoped = await _search_scoped(
+        session,
+        engineering,
+        SEARCH["requirement"],
+        "Asset Taxonomy & Catalogue",
+    )
+    assert REQUIREMENT_ID not in scoped, (
+        "a User Access requirement surfaced under an Asset Taxonomy scope"
+    )
+
+
+async def test_an_unknown_capability_returns_nothing_rather_than_everything(
+    session, world
+) -> None:
+    """A typo or a stale chip must fail closed, not fall back to unscoped."""
+    await _label_capabilities(session, world)
+    engineering = await principal_for(session, world["users"]["engineering"])
+
+    scoped = await _search_scoped(
+        session, engineering, SEARCH["requirement"], "No Such Capability"
+    )
+    assert scoped == ""

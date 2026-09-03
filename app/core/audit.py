@@ -30,6 +30,7 @@ class Event:
     DOC_UPDATED = "document_updated"
     DOC_DELETED = "document_deleted"
     DOC_APPROVED = "document_approved"
+    DOC_ENRICHED = "document_enriched"
     DOC_REJECTED = "document_rejected"
     ACL_CHANGED = "acl_changed"
     ROLE_GRANTED = "role_granted"

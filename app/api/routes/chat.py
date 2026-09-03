@@ -71,7 +71,7 @@ async def ask(
 ) -> AnswerOut:
     await enforce_rate_limit(principal)
     result = await answer_service.answer_question(
-        session, principal, payload.question, payload.history
+        session, principal, payload.question, payload.history, payload.capability
     )
     return AnswerOut(
         answer=result.answer,
@@ -83,6 +83,8 @@ async def ask(
         cached=result.cached,
         latency_ms=result.latency_ms,
         chunks_used=result.chunks_used,
+        clarify=result.clarify,
+        capability=result.capability,
     )
 
 
@@ -97,7 +99,11 @@ async def ask_stream(
     async def events() -> AsyncIterator[str]:
         try:
             async for name, data in answer_service.stream_answer(
-                session, principal, payload.question, payload.history
+                session,
+                principal,
+                payload.question,
+                payload.history,
+                payload.capability,
             ):
                 yield f"event: {name}\ndata: {json.dumps(data, default=str)}\n\n"
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an event
@@ -243,7 +249,7 @@ async def compare_roles(
             clearance=role.clearance,
         )
         context, _ = await answer_service.gather_context(
-            session, probe, payload.question
+            session, probe, payload.question, capability=payload.capability
         )
         total_matching = max(
             total_matching, len(context.chunks) + context.blocked_chunk_count
@@ -251,7 +257,7 @@ async def compare_roles(
 
         if context.chunks:
             result = await answer_service.answer_question(
-                session, probe, payload.question
+                session, probe, payload.question, capability=payload.capability
             )
             text, refused, citations = (
                 result.answer,

@@ -131,6 +131,19 @@ role, or status change — invalidates every entry at once.
 - **Hardened XML parsing.** `.docx`/`.xlsx` are zips of XML from an upload
   path; `defusedxml` blocks entity-expansion denial of service.
 - **Upload limits.** 25 MB, extension allowlist.
+- **Generated context is embedded, never shown.** `chunks.context` is written
+  by a model at ingest to make near-identical chunks distinguishable. It is
+  part of what gets embedded and no part of what gets read: `RetrievedChunk`
+  has no field for it, the search query never selects the column, and the
+  full-text index is computed from `text` alone. The worst a hallucinated
+  passage can do is rank a chunk oddly; it can never be quoted as a claim.
+  *Tests:* `tests/test_enrichment.py`.
+- **Capability scoping only narrows.** A question can be scoped to one part of
+  the product, and that scope arrives in the request body. `SCOPED_DOCS_CTE`
+  selects **from** `visible_docs`, so it can only ever return a subset of what
+  the caller was already entitled to read -- naming a capability you cannot
+  read returns nothing rather than granting it. The access predicate itself is
+  untouched. *Tests:* the capability section of `test_rbac_leakage.py`.
 
 ## Threat model
 
@@ -166,8 +179,19 @@ role, or status change — invalidates every entry at once.
 ## Verifying it yourself
 
 ```bash
-pytest tests/security -q          # needs DATABASE_URL for the leakage suite
+TEST_DATABASE_URL=postgresql+asyncpg://...   # a SCRATCH database
+ALLOW_DESTRUCTIVE_TESTS=1 pytest tests/security -q
 ```
+
+**The leakage suite drops every table it finds.** It reads `TEST_DATABASE_URL`
+and never `DATABASE_URL`, and it fails the run outright if the two are equal.
+
+That separation exists because the earlier design -- one URL plus an opt-in
+flag -- was not enough, and failed in practice: the flag confirms you know the
+suite is destructive, and says nothing about which database happens to be
+configured. Running it with `.env` pointing at the live project destroyed 23
+enriched documents and 806 chunks, and every component behaved as designed. A
+second confirmation would not have helped. A separate address does.
 
 The suite plants distinctive strings ("Partner Entitlement Envelope",
 `UAP-TC-047`, `GLOBEXONLYTOKEN`) in fixture documents and asserts, per role,

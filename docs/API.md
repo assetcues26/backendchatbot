@@ -11,7 +11,7 @@ from the database using the user id in the verified token.
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/me` | Caller's roles, clearance, tenant. |
-| `POST` | `/api/ask` | `{question}` returns answer plus citations. Rate limited. |
+| `POST` | `/api/ask` | `{question, history, capability}` returns answer plus citations. Rate limited. |
 | `POST` | `/api/ask/stream` | Server-sent events. |
 | `POST` | `/api/access-request` | Raised from a refusal. Returns nothing about what was withheld. |
 
@@ -21,9 +21,36 @@ from the database using the user id in the verified token.
 |---|---|
 | `sources` | Chunks in play, sent before generation so the UI can show provenance early. |
 | `delta` | One token. |
-| `done` | `{citations, refused, cached, latency_ms}` |
+| `done` | `{turn_id, citations, follow_ups, refused, cached, clarify, capability, latency_ms}` |
 | `retracted` | `{answer, reason}` — citation validation failed; replace what was streamed. |
 | `error` | `{message, detail}` |
+
+### Clarifying questions
+
+When a question fits several parts of the product equally well, the answer is
+a **question** and `clarify` lists the areas to choose from. Re-ask the same
+question with one of them as `capability`, or `"*"` to mean "all of them" --
+which is not the same as omitting it, because an omitted capability is an
+unrouted question that may clarify again.
+
+```
+POST /api/ask   {"question": "What are the open items?"}
+  -> {"answer": "That question fits more than one part of the product.
+                 Did you mean Fields and Screens, Approval Workflow
+                 Management, or Reporting Period Management?",
+      "clarify": ["Fields and Screens", "Approval Workflow Management",
+                  "Reporting Period Management"],
+      "citations": []}
+
+POST /api/ask   {"question": "What are the open items?",
+                 "capability": "Approval Workflow Management"}
+  -> {"answer": "...", "capability": "Approval Workflow Management",
+      "clarify": [], "citations": [...]}
+```
+
+`capability` is a **search scope, not a permission**. It can only narrow what
+the access predicate already allowed, so naming an area you cannot read
+returns nothing rather than granting it.
 
 ## Admin (requires the `admin` role)
 

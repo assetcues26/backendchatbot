@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from app.api import schemas
 from app.api.routes import admin, chat
 from app.core.security import current_principal, require_admin
+from app.rag import retrieval
 
 # Fields that would let a caller assert their own identity.
 FORBIDDEN_CALLER_FIELDS = {
@@ -80,13 +81,45 @@ def test_ask_request_carries_only_a_question_and_prior_questions() -> None:
     QUESTIONS. It must never grow a slot for assistant answers: a client can
     put anything in a request body, and fabricated "the assistant said X"
     text would be attacker-controlled input going straight into the prompt.
+
+    `capability` was added for clarifying questions. It is a search scope, not
+    a permission -- it is applied by `SCOPED_DOCS_CTE`, which selects FROM
+    `visible_docs` and so can only ever return a subset of what the caller
+    could already read. The narrowing property is asserted directly in
+    tests/security/test_rbac_leakage.py.
     """
-    assert set(schemas.AskRequest.model_fields) == {"question", "history"}
+    assert set(schemas.AskRequest.model_fields) == {
+        "question",
+        "history",
+        "capability",
+    }
 
     history = schemas.AskRequest.model_fields["history"]
     assert history.annotation == list[str], (
         "history must be a flat list of question strings; a structured turn "
         "type would let an assistant answer be smuggled in"
+    )
+
+
+def test_capability_scope_is_only_ever_applied_as_a_subset() -> None:
+    """The scope must narrow `visible_docs`, never sit beside it.
+
+    Written as a check on the SQL because that is where the property lives: a
+    `scoped_docs` CTE that selected straight from `documents` would be a
+    second, weaker access path, and it would look almost identical.
+    """
+    body = " ".join(retrieval.SCOPED_DOCS_CTE.split())
+    assert "SELECT v.id FROM visible_docs v" in body, (
+        "scoped_docs must select FROM visible_docs so it can only ever narrow"
+    )
+    assert "document_acl" not in retrieval.SCOPED_DOCS_CTE
+
+    sql = retrieval._HYBRID_SEARCH_SQL
+    assert sql.count("JOIN scoped_docs v") == 2, (
+        "both halves of the hybrid search must read through the scope"
+    )
+    assert "JOIN visible_docs v ON v.id = c.document_id" not in sql, (
+        "a search half that joins visible_docs directly bypasses the scope"
     )
 
 

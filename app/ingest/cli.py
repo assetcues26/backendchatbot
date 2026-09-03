@@ -7,6 +7,8 @@ deleting documents whose source file is gone.
     acues-ingest sync "C:/path/to/Product Doc"
     acues-ingest sync ./docs --auto-approve      # demo bootstrap only
     acues-ingest sync ./docs --dry-run
+    acues-ingest enrich              # profile and situate anything unenriched
+    acues-ingest enrich --all --force  # rewrite every context from scratch
     acues-ingest status
 
 Idempotent: running it twice makes no embedding calls the second time,
@@ -24,11 +26,12 @@ from pathlib import Path
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import audit
 from app.core.principal import ROLE_ADMIN, Principal
 from app.db.models import Chunk, DocStatus, Document, Role
 from app.db.seed import INTERNAL_TENANT_SLUG, seed_all, suggest_access
 from app.db.session import dispose_engine, get_session_factory
-from app.ingest import pipeline
+from app.ingest import backfill, pipeline
 from app.ingest.parsers import SUPPORTED_SUFFIXES
 
 # A stable identity for actions taken by the command line rather than a person.
@@ -207,6 +210,100 @@ async def _remove_missing(
     return removed
 
 
+async def cmd_enrich(args: argparse.Namespace) -> int:
+    """Re-run the enrichment pass over documents already in the database.
+
+    This is what makes a prompt improvement deployable: nobody has to find the
+    original folder and re-upload it. It reads the text back out of the chunks,
+    profiles the document, writes a context for each chunk and re-embeds only
+    what actually changed.
+
+    Access is untouched -- no ACL, sensitivity or status is written -- but every
+    cached answer is invalidated at the end, because the retrieval those answers
+    were built from has moved.
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        tenant_id, role_ids = await seed_all(session)
+        await session.commit()
+
+        documents = await backfill.select_documents(
+            session, tenant_id=tenant_id, only_missing=not args.all
+        )
+        if not documents:
+            print(
+                "Nothing to enrich. Every document already has a profile; "
+                "use --all to re-run them anyway."
+            )
+            return 0
+
+        print(f"Enriching {len(documents)} document(s)\n")
+
+        if args.dry_run:
+            for doc in documents:
+                state = "enriched" if doc.enriched_at else "never enriched"
+                print(f"  would enrich  {doc.source_key:<52} [{state}]")
+            print(
+                f"\n{len(documents)} document(s) would be processed. "
+                "No changes made."
+            )
+            return 0
+
+        principal = _system_principal(tenant_id, role_ids)
+        siblings = await pipeline.sibling_capabilities(session, tenant_id)
+
+        done = failed = 0
+        contexts_total = embedded_total = 0
+
+        for doc in documents:
+            try:
+                report = await backfill.enrich_stored_document(
+                    session, doc, siblings=siblings, force=args.force
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad document is not a run
+                await session.rollback()
+                failed += 1
+                print(f"  FAILED   {doc.source_key}: {type(exc).__name__}: {exc}")
+                continue
+
+            await audit.record(
+                session,
+                audit.Event.DOC_ENRICHED,
+                principal=principal,
+                document_id=doc.id,
+                title=doc.title,
+                capability=report.capability,
+                chunks=report.chunks_total,
+                contexts=report.contexts_written,
+                re_embedded=report.chunks_embedded,
+            )
+            await session.commit()
+
+            # A capability learned from one document teaches its neighbours.
+            if doc.capability and doc.module and doc.capability != doc.module:
+                siblings.setdefault(doc.module, doc.capability)
+
+            done += 1
+            contexts_total += report.contexts_written
+            embedded_total += report.chunks_embedded
+            note = f"  {report.message}" if report.message else ""
+            print(
+                f"  enriched  {doc.source_key:<52} "
+                f"[{report.contexts_written}/{report.chunks_total} contexts, "
+                f"{report.chunks_embedded} re-embedded]  "
+                f"{report.capability or '(no capability)'}{note}"
+            )
+
+        if done:
+            # Cached answers were built from the old vectors. Retire them.
+            await audit.bump_acl_version(session)
+            await session.commit()
+
+    print(f"\nenriched={done} failed={failed}")
+    print(f"contexts written={contexts_total} embeddings computed={embedded_total}")
+    return 0 if failed == 0 else 2
+
+
 async def cmd_status(_: argparse.Namespace) -> int:
     factory = get_session_factory()
     async with factory() as session:
@@ -275,6 +372,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync.add_argument("--dry-run", action="store_true", help="list actions only")
     sync.set_defaults(func=cmd_sync)
+
+    enrich = sub.add_parser(
+        "enrich",
+        help="re-run the enrichment pass over documents already ingested",
+    )
+    enrich.add_argument(
+        "--all",
+        action="store_true",
+        help="include documents that already have a profile "
+        "(default: only those that have never been enriched)",
+    )
+    enrich.add_argument(
+        "--force",
+        action="store_true",
+        help="rewrite contexts that already exist, instead of keeping them",
+    )
+    enrich.add_argument("--dry-run", action="store_true", help="list actions only")
+    enrich.set_defaults(func=cmd_enrich)
 
     status = sub.add_parser("status", help="show what is in the database")
     status.set_defaults(func=cmd_status)

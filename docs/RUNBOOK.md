@@ -32,6 +32,16 @@ acues-ingest sync "C:/path/to/Product Doc"
 They land in `PENDING_REVIEW` and are readable by nobody. Approve them in the
 admin panel, or use `--auto-approve` to apply the default matrix for a demo.
 
+Ingest also reads each document and writes a short context per chunk, so that
+chunks which are identical as text across different parts of the product can
+still be told apart. For documents already loaded before that existed, run
+`acues-ingest enrich`. See `docs/INGESTION.md`.
+
+Set `TEST_DATABASE_URL` to a **separate scratch database** while you are here.
+`tests/security` drops every table it finds and refuses to run against the
+same database as `DATABASE_URL`; that is the only thing standing between a
+routine test run and the corpus.
+
 ### 4. First admin user
 
 Sign in through the frontend once so Supabase mints the account, then promote

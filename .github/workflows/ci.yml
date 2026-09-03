@@ -26,12 +26,15 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/assetcues_test
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/assetcues_ci
+      # The security suite reads this one, never DATABASE_URL, and refuses to
+      # run if the two are equal. Both point at the same throwaway service
+      # container here, which dies with the job -- but they are still separate
+      # databases, because the guard is only worth having if CI exercises it.
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/assetcues_test
       OPENAI_API_KEY: not-used-tests-use-deterministic-fake-embeddings
       SUPABASE_JWT_SECRET: test-secret
       ENVIRONMENT: development
-      # The security suite drops every table. Safe here: the database is a
-      # throwaway service container that dies with the job.
       ALLOW_DESTRUCTIVE_TESTS: "1"
 
     steps:
@@ -44,6 +47,14 @@ jobs:
 
       - name: Install
         run: pip install -e ".[dev]"
+
+      # DATABASE_URL and TEST_DATABASE_URL must be two different databases or
+      # the security suite refuses to run, so create the second one. Both are
+      # in the same throwaway container; the point is that CI exercises the
+      # same separation the runbook asks a human for.
+      - name: Create the working database beside the scratch one
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d assetcues_test -c 'CREATE DATABASE assetcues_ci'
 
       - name: Lint
         run: ruff check .

@@ -27,6 +27,7 @@ def make_chunk(ordinal: int, title: str = "User Access") -> RetrievedChunk:
         token_count=10,
         title=title,
         module="m",
+        capability="User Access & Permission Management",
         doc_type="Product & Functional Specification",
         sensitivity=3,
         score=0.5,
@@ -40,7 +41,7 @@ def make_chunk(ordinal: int, title: str = "User Access") -> RetrievedChunk:
 
 def test_history_accepts_only_a_list_of_questions() -> None:
     """No slot exists for an assistant turn, so none can be smuggled in."""
-    assert set(AskRequest.model_fields) == {"question", "history"}
+    assert set(AskRequest.model_fields) == {"question", "history", "capability"}
     request = AskRequest(question="what about sales?", history=["Who is admin?"])
     assert request.history == ["Who is admin?"]
 

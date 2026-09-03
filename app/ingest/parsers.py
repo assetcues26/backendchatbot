@@ -258,6 +258,67 @@ def extract_declared_audience(markdown: str) -> list[str]:
     return []
 
 
+def extract_header_fields(markdown: str) -> dict[str, str]:
+    """Read the document-control table at the top of an AssetCues file.
+
+    These documents state their own place in the product taxonomy:
+
+        | Capability     | Approval Workflow Management         |
+        | Module         | Platform Administration & Controls   |
+        | Product domain | Platform Foundation & Administration |
+
+    Capability is what the assistant routes on, so taking it from the file is
+    both free and correct by construction -- no grouping to invent, and no
+    mapping to maintain as documents are added. Only the fields below are
+    returned; anything else in that table is ignored.
+
+    Scoped to the masthead because these labels recur in body prose ("the
+    Module must be enabled..."), and a match there would be a different
+    statement entirely.
+    """
+    # "Product area" is the Fields & Screens template's name for the same
+    # thing the others call Module.
+    wanted = {
+        "capability": "capability",
+        "module": "module_declared",
+        "product area": "module_declared",
+        "product domain": "product_domain",
+        "version": "version_label",
+        "document status": "status_label",
+        "status": "status_label",
+    }
+    found: dict[str, str] = {}
+
+    def offer(label: str, value: str) -> None:
+        key = wanted.get(label.lower().strip(" :*"))
+        if not key or key in found:
+            return
+        value = value.strip().strip("*").strip()
+        # Skip separator rows and the header row of a two-column table whose
+        # left cell happens to read "Document field".
+        if not value or set(value) <= {"-", ":"} or value.lower() in {"value", "status"}:
+            return
+        found[key] = value[:200]
+
+    # Three masthead shapes appear across these files, so all three are read:
+    #   | Capability | Asset Taxonomy & Catalogue |   table row
+    #   Capability: Asset Taxonomy & Catalogue       plain line
+    #   (neither -- the document pass infers it)
+    for line in markdown.splitlines()[:80]:
+        stripped = line.strip()
+        if "|" in stripped:
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if len(cells) >= 2:
+                offer(cells[0], cells[1])
+            continue
+
+        label, sep, value = stripped.partition(":")
+        if sep and len(label) < 30:
+            offer(label, value)
+
+    return found
+
+
 def _split_audience(value: str) -> list[str]:
     """Split an audience cell into names.
 

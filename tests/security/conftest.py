@@ -7,9 +7,9 @@ predicate lives in the query.
 They do not need OpenAI. Embeddings are deterministic fakes, so the suite is
 free to run and fast enough for every commit.
 
-Set DATABASE_URL to run them. CI provides pgvector/pgvector:pg16 as a service
-container; locally, point it at a scratch Supabase project. Without it the
-whole module skips rather than failing.
+Set TEST_DATABASE_URL -- deliberately NOT DATABASE_URL -- to a scratch
+Postgres. CI provides pgvector/pgvector:pg16 as a service container. Without
+it the whole module skips rather than failing.
 """
 
 from __future__ import annotations
@@ -62,37 +62,62 @@ def fake_embedding(text_value: str) -> list[float]:
 
 
 def _database_url() -> str | None:
-    """The database to test against, or None to skip.
+    """The scratch database to test against, or None to skip.
 
-    The localhost placeholder from tests/conftest.py means "nothing real was
-    configured", so treat it as absent rather than trying to connect and
-    failing with a confusing error.
+    Read from TEST_DATABASE_URL and never from DATABASE_URL. That separation
+    is the whole protection and it is not a style choice -- see the note
+    below.
     """
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("TEST_DATABASE_URL", "")
     if not url:
         return None
-    placeholder = "postgres:postgres@localhost:5432/postgres"
-    if placeholder in url:
+
+    # The placeholder from tests/conftest.py means "nothing real was
+    # configured", so treat it as absent rather than failing on connect.
+    if "postgres:postgres@localhost:5432/postgres" in url:
         return None
+
     return url
+
+
+def _refuses_to_run_against(url: str) -> str:
+    """Why this database must not be used, or an empty string if it is fine."""
+    working = os.environ.get("DATABASE_URL", "")
+    if working and url.strip() == working.strip():
+        return (
+            "TEST_DATABASE_URL is the same database as DATABASE_URL. This "
+            "suite drops every table; pointing it at the working database "
+            "destroys the corpus."
+        )
+    return ""
 
 
 # THIS SUITE IS DESTRUCTIVE. It drops and recreates every table.
 #
-# The same DATABASE_URL serves the app, `alembic upgrade` and `acues-ingest`,
-# so running this against the working database deletes the corpus. Two earlier
-# designs failed: a row-count guard could not tell leftover fixtures from real
-# documents, and a separate Postgres schema was silently defeated by
-# `create_all` finding `public.chunks` through the search_path and creating
-# nothing.
+# It reads TEST_DATABASE_URL, never DATABASE_URL, and refuses to run when the
+# two are equal. That is deliberate, and it is the third design:
 #
-# So the protection is an explicit opt-in rather than a heuristic. It cannot
-# misfire and it cannot be misread:
+#   1. A row-count guard could not tell leftover fixtures from real documents.
+#   2. A separate Postgres schema was silently defeated by `create_all`
+#      finding `public.chunks` through the search_path and creating nothing.
+#   3. An opt-in flag -- ALLOW_DESTRUCTIVE_TESTS=1 -- against DATABASE_URL.
 #
-#     ALLOW_DESTRUCTIVE_TESTS=1 pytest tests/security
+# The third looked sufficient and was not. The flag says "yes, I accept this
+# is destructive"; it says nothing about WHICH database is configured, and the
+# configured one is the working database by default. Setting the flag while
+# .env pointed at the live project dropped 23 enriched documents and 806
+# chunks, and every part of that was working as designed.
 #
-# CI sets it because CI runs a throwaway container. Locally, set it only when
-# you are certain the database is scratch.
+# A confirmation flag cannot fix that, because the mistake is not "I forgot it
+# was destructive" -- it is "I forgot what DATABASE_URL was pointing at". So
+# the address is separate now: this suite can only ever reach a database that
+# was configured for it and nothing else.
+#
+#     TEST_DATABASE_URL=postgresql+asyncpg://...
+#     ALLOW_DESTRUCTIVE_TESTS=1
+#     pytest tests/security
+#
+# The flag stays as a second hand on the wheel. The separate URL is the brake.
 _schema_ready = False
 
 # Every table the fixtures write to, ordered so TRUNCATE ... CASCADE is cheap.
@@ -116,11 +141,21 @@ _DATA_TABLES = (
 async def session() -> AsyncIterator[AsyncSession]:
     url = _database_url()
     if url is None:
-        pytest.skip("set DATABASE_URL to a Postgres with pgvector to run these")
+        pytest.skip(
+            "set TEST_DATABASE_URL to a SCRATCH Postgres with pgvector to run "
+            "these. It is deliberately not DATABASE_URL: this suite drops "
+            "every table."
+        )
+
+    refusal = _refuses_to_run_against(url)
+    if refusal:
+        # Not a skip. A skip is what someone scrolls past; this is a mistake
+        # that costs the corpus, so it stops the run.
+        pytest.fail(refusal, pytrace=False)
 
     if not os.environ.get("ALLOW_DESTRUCTIVE_TESTS"):
         pytest.skip(
-            "this suite DROPS EVERY TABLE in DATABASE_URL. Re-run with "
+            "this suite DROPS EVERY TABLE in TEST_DATABASE_URL. Re-run with "
             "ALLOW_DESTRUCTIVE_TESTS=1 once you are sure that database is "
             "scratch -- never against one holding your documents."
         )

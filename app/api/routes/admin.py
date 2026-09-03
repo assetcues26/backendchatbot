@@ -90,6 +90,12 @@ async def _document_out(session: AsyncSession, doc: Document) -> DocumentOut:
         classifier_rationale=doc.classifier_rationale,
         granted_role_keys=sorted(granted),
         chunk_count=int(count),
+        capability=doc.capability,
+        product_domain=doc.product_domain,
+        summary=doc.summary,
+        key_terms=list(doc.key_terms or []),
+        distinguishing_points=list(doc.distinguishing_points or []),
+        enriched_at=doc.enriched_at,
         created_at=doc.created_at,
         updated_at=doc.updated_at,
     )
@@ -120,6 +126,18 @@ async def upload_document(
 
     The uploaded file lands in PENDING_REVIEW and is readable by nobody until
     it is approved, whether it is new or a replacement.
+
+    This request is slow on purpose: it parses, classifies, reads the document
+    to profile it, writes a context for every chunk, and embeds. Measured on
+    the real corpus that is about 19s for a 14-chunk specification and 42s for
+    a 115-chunk test workbook.
+
+    It is synchronous because the alternative -- return immediately and enrich
+    in the background -- introduces a document that can be stuck in PROCESSING
+    forever if the worker dies, and this deployment is a single free-tier
+    instance with no job store to recover from. If documents get much larger
+    than the current corpus, that trade flips: give the upload a background
+    task and have the admin panel poll `status`.
     """
     filename = file.filename or "upload"
     suffix = ("." + filename.rsplit(".", 1)[-1]).lower() if "." in filename else ""

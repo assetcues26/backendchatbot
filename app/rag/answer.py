@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core import audit
 from app.core.principal import Principal
-from app.rag import guardrails, llm, prompts
+from app.rag import guardrails, llm, prompts, routing
 from app.rag.retrieval import RetrievalResult, RetrievedChunk, retrieve
 
 
@@ -62,6 +62,11 @@ class AnswerResult:
     anomalies: list[str] = field(default_factory=list)
     injection_findings: list[dict[str, object]] = field(default_factory=list)
     cached: bool = False
+    # Which part of the product this was answered from, and -- when the
+    # question fitted several equally well -- the choices offered instead
+    # of a guess. A non-empty `clarify` means `answer` is a question.
+    capability: str = ""
+    clarify: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +87,15 @@ _CACHE_TTL_SECONDS = 300
 _CACHE_MAX_ENTRIES = 500
 
 
-def cache_key(question: str, principal: Principal, acl_version: int) -> str:
+def cache_key(
+    question: str, principal: Principal, acl_version: int, capability: str = ""
+) -> str:
     normalised = " ".join(question.lower().split())
-    material = f"{normalised}|{principal.acl_fingerprint()}|v{acl_version}"
+    # The scope is part of the key: the same question answered from two
+    # capabilities is two different answers.
+    material = (
+        f"{normalised}|{principal.acl_fingerprint()}|v{acl_version}|{capability}"
+    )
     return hashlib.sha256(material.encode()).hexdigest()
 
 
@@ -225,7 +236,10 @@ async def suggest_follow_ups(
 
 
 async def gather_context(
-    session: AsyncSession, principal: Principal, question: str
+    session: AsyncSession,
+    principal: Principal,
+    question: str,
+    capability: str = "",
 ) -> tuple[RetrievalResult, list[float]]:
     """Embed and retrieve. `question` must already be standalone."""
     settings = get_settings()
@@ -238,8 +252,106 @@ async def gather_context(
         top_k=settings.retrieval_top_k,
         candidates=settings.retrieval_candidates,
         rrf_k=settings.rrf_k,
+        capability=capability,
     )
     return result, vector
+
+
+def search_scope(capability: str) -> str:
+    """The value retrieval should filter on for a requested capability.
+
+    `ALL_CAPABILITIES` means "no filter", not "a capability literally named
+    `*`" -- passing it through would match nothing and refuse every question.
+    """
+    return "" if capability == routing.ALL_CAPABILITIES else capability
+
+
+async def route_question(
+    session: AsyncSession,
+    principal: Principal,
+    question: str,
+    context: RetrievalResult,
+    capability: str,
+) -> tuple[RetrievalResult, routing.Route]:
+    """Work out which part of the product to answer from.
+
+    When the caller already chose one -- they clicked a chip on a clarifying
+    question -- that choice stands and the retrieval was scoped to it already.
+
+    Otherwise the routing runs over what came back. If the question named a
+    capability outright, it is worth retrieving again scoped to it: the first
+    pass spent most of its twelve slots on other capabilities, and the reader
+    asked about one.
+    """
+    if capability == routing.ALL_CAPABILITIES:
+        # They have seen the choices and want the lot. Do not ask again.
+        return context, routing.Route(reason="the caller asked for every area")
+
+    if capability:
+        return context, routing.Route(
+            capability=capability, reason="chosen by the caller"
+        )
+
+    decision = routing.route(question, context.chunks)
+
+    if decision.named and decision.capability:
+        scoped, _ = await gather_context(
+            session,
+            principal,
+            question,
+            capability=search_scope(decision.capability),
+        )
+        # An empty scoped result means the capability name matched something
+        # this caller cannot read. Keep what they could.
+        if scoped.chunks:
+            return scoped, decision
+
+    return context, decision
+
+
+async def _finalise_clarification(
+    session: AsyncSession,
+    principal: Principal,
+    question: str,
+    decision: routing.Route,
+    context: RetrievalResult,
+    started: float,
+) -> AnswerResult:
+    """Return a question instead of an answer.
+
+    No model call and no citations: nothing has been answered, and presenting
+    it with sources would suggest otherwise. The arithmetic that triggered it
+    goes into the audit row, so "why did it ask me that?" is answerable
+    afterwards without re-running anything.
+    """
+    latency = int((time.time() - started) * 1000)
+    event = await audit.record(
+        session,
+        audit.Event.QUERY,
+        principal=principal,
+        question=question[:500],
+        chunks_used=len(context.chunks),
+        documents_used=sorted({str(c.document_id) for c in context.chunks}),
+        blocked_chunk_count=context.blocked_chunk_count,
+        clarified=True,
+        routing_reason=decision.reason,
+        candidates=[
+            {"capability": c.capability, "share": round(c.share, 3)}
+            for c in decision.candidates
+        ],
+        latency_ms=latency,
+    )
+    await session.commit()
+
+    return AnswerResult(
+        answer=routing.clarification_question(decision.candidates),
+        turn_id=str(event.id),
+        clarify=decision.choices,
+        latency_ms=latency,
+        chunks_used=len(context.chunks),
+        blocked_document_count=len(context.blocked),
+        blocked_chunk_count=context.blocked_chunk_count,
+    )
 
 
 async def _finalise(
@@ -250,6 +362,7 @@ async def _finalise(
     context: RetrievalResult,
     started: float,
     follow_ups: list[str] | None = None,
+    decision: routing.Route | None = None,
 ) -> AnswerResult:
     """Post-generation checks and the audit write. Shared by both paths."""
     check = guardrails.validate_citations(
@@ -330,6 +443,8 @@ async def _finalise(
         blocked_chunk_count=context.blocked_chunk_count,
         citations=sorted(check.cited),
         retracted=retracted,
+        capability=decision.capability if decision else "",
+        routing_reason=decision.reason if decision else "",
         latency_ms=latency,
     )
     await session.commit()
@@ -351,6 +466,7 @@ async def _finalise(
         blocked_chunk_count=context.blocked_chunk_count,
         anomalies=context.anomalies,
         injection_findings=injection,
+        capability=decision.capability if decision else "",
     )
 
 
@@ -359,8 +475,14 @@ async def answer_question(
     principal: Principal,
     question: str,
     history: list[str] | None = None,
+    capability: str = "",
 ) -> AnswerResult:
-    """Non-streaming answer. Used by the role-comparison view and tests."""
+    """Non-streaming answer. Used by the role-comparison view and tests.
+
+    `capability` scopes the search to one part of the product. It arrives from
+    the client -- it is the chip someone clicked on a clarifying question --
+    and can only ever narrow what the access predicate already allowed.
+    """
     started = time.time()
     version = await audit.get_acl_version(session)
 
@@ -369,17 +491,29 @@ async def answer_question(
     # two people asking the same follow-up from different threads do not
     # collide.
     resolved = await condense_question(question, history or [])
-    key = cache_key(resolved, principal, version)
+    key = cache_key(resolved, principal, version, capability)
 
     hit = cache_get(key)
     if hit is not None:
         return replace(hit, cached=True)
 
-    context, _ = await gather_context(session, principal, resolved)
+    context, _ = await gather_context(
+        session, principal, resolved, capability=search_scope(capability)
+    )
 
     if not context.chunks:
         result = await _finalise(
             session, principal, resolved, prompts.REFUSAL_TEXT, context, started
+        )
+        cache_put(key, result)
+        return result
+
+    context, decision = await route_question(
+        session, principal, resolved, context, capability
+    )
+    if decision.needs_clarification:
+        result = await _finalise_clarification(
+            session, principal, resolved, decision, context, started
         )
         cache_put(key, result)
         return result
@@ -391,7 +525,7 @@ async def answer_question(
     )
     suggestions = await suggest_follow_ups(resolved, raw, context.chunks)
     result = await _finalise(
-        session, principal, resolved, raw, context, started, suggestions
+        session, principal, resolved, raw, context, started, suggestions, decision
     )
     cache_put(key, result)
     return result
@@ -402,16 +536,20 @@ async def stream_answer(
     principal: Principal,
     question: str,
     history: list[str] | None = None,
+    capability: str = "",
 ) -> AsyncIterator[tuple[str, object]]:
     """Yield (event_name, payload) pairs for the SSE endpoint.
 
     Events: `sources`, `delta`, `done`, `retracted`, `follow_ups`.
+
+    A clarifying question arrives as a normal `delta` plus a `clarify` list on
+    `done`, so a client that ignores the list still shows the question.
     """
     started = time.time()
     version = await audit.get_acl_version(session)
 
     resolved = await condense_question(question, history or [])
-    key = cache_key(resolved, principal, version)
+    key = cache_key(resolved, principal, version, capability)
 
     hit = cache_get(key)
     if hit is not None:
@@ -421,12 +559,16 @@ async def stream_answer(
             "citations": [asdict(c) for c in hit.citations],
             "follow_ups": hit.follow_ups,
             "refused": hit.refused,
+            "clarify": hit.clarify,
+            "capability": hit.capability,
             "cached": True,
             "latency_ms": hit.latency_ms,
         }
         return
 
-    context, _ = await gather_context(session, principal, resolved)
+    context, _ = await gather_context(
+        session, principal, resolved, capability=search_scope(capability)
+    )
 
     if not context.chunks:
         result = await _finalise(
@@ -439,6 +581,28 @@ async def stream_answer(
             "citations": [],
             "follow_ups": [],
             "refused": True,
+            "clarify": [],
+            "capability": "",
+            "cached": False,
+        }
+        return
+
+    context, decision = await route_question(
+        session, principal, resolved, context, capability
+    )
+    if decision.needs_clarification:
+        result = await _finalise_clarification(
+            session, principal, resolved, decision, context, started
+        )
+        cache_put(key, result)
+        yield "delta", result.answer
+        yield "done", {
+            "turn_id": result.turn_id,
+            "citations": [],
+            "follow_ups": [],
+            "refused": False,
+            "clarify": result.clarify,
+            "capability": "",
             "cached": False,
         }
         return
@@ -469,7 +633,7 @@ async def stream_answer(
     # never kept waiting on them.
     suggestions = await suggest_follow_ups(resolved, raw, context.chunks)
     result = await _finalise(
-        session, principal, resolved, raw, context, started, suggestions
+        session, principal, resolved, raw, context, started, suggestions, decision
     )
     cache_put(key, result)
 
@@ -485,6 +649,8 @@ async def stream_answer(
         "citations": [asdict(c) for c in result.citations],
         "follow_ups": result.follow_ups,
         "refused": result.refused,
+        "clarify": [],
+        "capability": result.capability,
         "cached": False,
         "latency_ms": result.latency_ms,
     }

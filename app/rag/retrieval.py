@@ -98,13 +98,34 @@ visible_docs AS (
 )
 """
 
+# Capability scoping. This is NOT part of the access predicate and must never
+# become part of it: it selects FROM visible_docs, so whatever it does it can
+# only ever return a subset of what the caller was already entitled to read.
+#
+# That matters because the capability arrives from the client -- it is the
+# chip a user clicked on a clarifying question. Written this way, passing a
+# capability you cannot read returns nothing; it cannot widen anything, and no
+# reasoning about the value is required to see that.
+#
+# An empty string means "no scoping", which is the ordinary case.
+SCOPED_DOCS_CTE = """
+scoped_docs AS (
+    SELECT v.id
+    FROM visible_docs v
+    JOIN documents d ON d.id = v.id
+    WHERE :capability = '' OR d.capability = :capability
+)
+"""
+
+
 _HYBRID_SEARCH_SQL = f"""
 WITH {VISIBLE_DOCS_CTE},
+{SCOPED_DOCS_CTE},
 vector_hits AS (
     SELECT c.id,
            ROW_NUMBER() OVER (ORDER BY c.embedding <=> CAST(:qvec AS vector)) AS rnk
     FROM chunks c
-    JOIN visible_docs v ON v.id = c.document_id
+    JOIN scoped_docs v ON v.id = c.document_id
     WHERE c.embedding IS NOT NULL
     ORDER BY c.embedding <=> CAST(:qvec AS vector)
     LIMIT :candidates
@@ -115,7 +136,7 @@ text_hits AS (
                ORDER BY ts_rank_cd(c.tsv, websearch_to_tsquery('english', :query)) DESC
            ) AS rnk
     FROM chunks c
-    JOIN visible_docs v ON v.id = c.document_id
+    JOIN scoped_docs v ON v.id = c.document_id
     WHERE c.tsv @@ websearch_to_tsquery('english', :query)
     ORDER BY ts_rank_cd(c.tsv, websearch_to_tsquery('english', :query)) DESC
     LIMIT :candidates
@@ -137,6 +158,7 @@ SELECT c.id            AS chunk_id,
        c.token_count   AS token_count,
        d.title         AS title,
        d.module        AS module,
+       d.capability    AS capability,
        d.doc_type      AS doc_type,
        d.sensitivity   AS sensitivity,
        f.score         AS score
@@ -208,6 +230,7 @@ class RetrievedChunk:
     token_count: int
     title: str
     module: str
+    capability: str
     doc_type: str
     sensitivity: int
     score: float
@@ -251,8 +274,14 @@ async def hybrid_search(
     top_k: int,
     candidates: int,
     rrf_k: int,
+    capability: str = "",
 ) -> list[RetrievedChunk]:
-    """Retrieve the top-k chunks this principal is entitled to read."""
+    """Retrieve the top-k chunks this principal is entitled to read.
+
+    `capability` narrows the search to one part of the product. It can only
+    ever remove documents from consideration -- see `SCOPED_DOCS_CTE` -- so
+    it is safe to take from the caller.
+    """
     if not principal.role_ids:
         # No roles means no positive grant is possible. Skip the round trip.
         return []
@@ -270,6 +299,7 @@ async def hybrid_search(
                 "candidates": candidates,
                 "rrf_k": rrf_k,
                 "top_k": top_k,
+                "capability": capability,
             },
         )
     ).mappings().all()
@@ -284,6 +314,7 @@ async def hybrid_search(
             token_count=r["token_count"] or 0,
             title=r["title"],
             module=r["module"] or "",
+            capability=r["capability"] or "",
             doc_type=r["doc_type"] or "",
             sensitivity=r["sensitivity"],
             score=float(r["score"]),
@@ -393,9 +424,16 @@ async def retrieve(
     top_k: int,
     candidates: int,
     rrf_k: int,
+    capability: str = "",
     collect_blocked: bool = True,
 ) -> RetrievalResult:
-    """Full retrieval path: G3 filter, then G4 re-verification."""
+    """Full retrieval path: G3 filter, then G4 re-verification.
+
+    `capability` narrows the search to one part of the product. It is applied
+    to the search only -- the G4 re-verification below re-asks the access
+    question and nothing else, so a scoping mistake can never be mistaken for
+    an access failure, nor hide one.
+    """
     chunks = await hybrid_search(
         session,
         principal,
@@ -404,6 +442,7 @@ async def retrieve(
         top_k=top_k,
         candidates=candidates,
         rrf_k=rrf_k,
+        capability=capability,
     )
     chunks, anomalies = await verify_chunks(session, principal, chunks)
 

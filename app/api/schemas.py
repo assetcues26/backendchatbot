@@ -47,6 +47,13 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     history: list[str] = Field(default_factory=list, max_length=5)
 
+    # Which part of the product to answer from -- the chip a user clicked
+    # on a clarifying question. This is a scope, not a permission: it can
+    # only ever narrow the search inside the access predicate, so naming a
+    # capability you cannot read returns nothing rather than granting it.
+    # See SCOPED_DOCS_CTE in app/rag/retrieval.py.
+    capability: str = Field(default="", max_length=200)
+
 
 class CitationOut(BaseModel):
     key: str
@@ -68,6 +75,12 @@ class AnswerOut(BaseModel):
     cached: bool = False
     latency_ms: int = 0
     chunks_used: int = 0
+
+    # Set when the question fitted several capabilities equally well. The
+    # `answer` is then a question, and these are the choices; a client
+    # re-asks with one of them in `capability`.
+    clarify: list[str] = []
+    capability: str = ""
 
 
 class RoleComparisonEntry(BaseModel):
@@ -152,6 +165,16 @@ class DocumentOut(BaseModel):
     classifier_rationale: str = ""
     granted_role_keys: list[str] = []
     chunk_count: int = 0
+
+    # What the enrichment pass learned. `enriched_at` stays null until it has
+    # run, which is what the admin panel shows as "not enriched yet".
+    capability: str = ""
+    product_domain: str = ""
+    summary: str = ""
+    key_terms: list[str] = []
+    distinguishing_points: list[str] = []
+    enriched_at: datetime | None = None
+
     created_at: datetime
     updated_at: datetime
 

@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     cors_origins: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
     rate_limit_per_minute: int = Field(default=20, alias="RATE_LIMIT_PER_MINUTE")
 
+    # --- Ingest enrichment
+    # Every document is written to the same template, so chunks from different
+    # capabilities can be byte-identical. Enrichment writes a short passage per
+    # chunk saying where it sits, embedded with the text but never shown and
+    # never citable. Turning it off costs ranking quality, never correctness.
+    enrichment_enabled: bool = Field(default=True, alias="ENRICHMENT_ENABLED")
+
     # --- Retrieval
     retrieval_candidates: int = Field(default=50, alias="RETRIEVAL_CANDIDATES")
     retrieval_top_k: int = Field(default=12, alias="RETRIEVAL_TOP_K")

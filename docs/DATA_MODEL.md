@@ -42,15 +42,27 @@ The important columns:
 | `source_key` | Stable identity across re-uploads; unique per tenant. |
 | `declared_audience` | Scraped verbatim from the document's own "Primary audience" field. |
 | `suggested_*` | The classifier's proposal, held for an admin to accept or override. Never used for access. |
+| `capability` | Which part of the product this document covers. Parsed from the document's own header table, falling back to a sibling's, then the folder. What query routing filters on. |
+| `module_declared`, `product_domain` | The coarser groupings the same header table declares. Recorded, not yet routed on. |
+| `summary`, `key_terms`, `distinguishing_points` | What the enrichment pass understood the document to be. Feeds chunk contextualisation and the admin panel. |
+| `enriched_at` | Null until a model pass has succeeded. What `acues-ingest enrich` looks for. |
 
 ### `chunks`
 `text`, `heading_path`, `text_sha256`, `token_count`, plus:
+
+- `context` — a short passage written at ingest saying where this chunk
+  sits in its document. Embedded together with the text, and **never**
+  displayed or cited: nothing selects this column into a query result, and
+  `RetrievedChunk` has no field for it. It exists because chunks from
+  different capabilities are often identical as text.
 
 - `embedding vector(1536)` — HNSW index with `vector_cosine_ops`, matching the
   `<=>` operator in the retrieval query. An index built with a different
   operator class is silently ignored by the planner.
 - `tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED` —
-  GIN indexed. Always in sync because Postgres maintains it.
+  GIN indexed. Always in sync because Postgres maintains it. Computed from
+  `text` only, deliberately: a keyword search must match words that are
+  really in the file, not words a model used to describe a neighbour.
 - `tenant_id` denormalised. Safe because tenancy is immutable for a document.
   The ACL is deliberately **not** denormalised, so a permission change takes
   effect immediately with no rows to backfill.
@@ -123,7 +135,7 @@ matches them literally. Do not convert `DocStatus` or `GrantEffect` to
 
 ## Scale
 
-742 chunks today. Everything above is comfortable to roughly 50,000 chunks on
+806 chunks across 23 documents today. Everything above is comfortable to roughly 50,000 chunks on
 Supabase's free tier. Beyond that, denormalise `allowed_role_ids` onto `chunks`
 with a GIN index and accept the backfill cost on ACL changes. That is a
 documented lever, not a rewrite.
